@@ -1,0 +1,106 @@
+@font-face { font-family: 'IconicFill'; src: url('../fonts/iconic_fill.eot'); src: url('../fonts/iconic_fill.eot?#iefix') format('embedded-opentype'), url('../fonts/iconic_fill.ttf') format('truetype'), url('../fonts/iconic_fill.svg#iconic') format('svg'); font-weight: normal; font-style: normal; }
+
+html {
+    font-family: Helvetica, Arial, "DejaVu Sans", sans-serif;
+    background-color: #fff;
+}
+
+html, body {
+    padding: 0;
+    margin: 0;
+    overflow: hidden;
+}
+
+.tile {
+    width: 48px;
+    height: 48px;
+    border: 2px solid white;
+    float: left;
+    visibility: hidden;
+}
+
+.info div {
+    position: absolute;
+}
+
+
+.info .track, .info .play {
+    border: 2px solid white;
+
+    z-index: 9001;
+    
+    background: rgba(240, 240, 240, 0.6);
+}
+
+.info .track {
+    padding: 5px;
+    width: 386px;
+    height: 86px;
+    top: 200px; 
+    left: 200px; 
+}
+
+.info .play {
+    width: 48px;
+    height: 48px;
+
+    bottom: 48px; 
+    left: 48px;
+}
+
+.track span {
+    display: block;
+}
+
+.track a, .track a:active, .track a:visited {
+    text-decoration:none;
+    color: #D9028B;
+}
+
+.track .title {
+    font-size: 21px;
+    color: #222;
+}
+
+.track .artist {
+    font-size: 18px;
+    color: #666;
+}
+
+.track .license {
+    position: absolute;
+    bottom: 5px;
+    font-size: 11px;
+}
+
+.play .button {
+    display: block;
+    font-size: 48px;
+    line-height: 55px;
+    text-align: center;
+}
+
+.symbol {
+    font-family: 'IconicFill';
+}
+
+.play a {
+    text-decoration: none;
+}
+
+.play a, .play a:active, .play a:visited {
+    color: #D9028B;
+}
+
+.visible {
+    visibility: visible;
+    opacity: 255;
+}
+
+.fadeout {
+  -webkit-transition: opacity 500ms ease-out;
+  -moz-transition: opacity 500ms ease-out;
+  -o-transition: opacity 500ms ease-out;
+  opacity: 0;
+}
+
