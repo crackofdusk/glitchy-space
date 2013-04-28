@@ -26,7 +26,7 @@ var init = function(playerButton, file, buffer, visualizeCallback) {
     audioSource = file;
     frequenciesBuffer = buffer;
     visualize = visualizeCallback;
-    player = Player.fromFile(audioSource);
+    player = AV.Player.fromFile(audioSource);
     initPlayer(player, button);
 }
 
@@ -73,7 +73,7 @@ var setupEventListeners = function(player, button) {
 
     player.on('end', function() {
         togglePlay(player, button);
-        player = Player.fromFile(audioSource);
+        player = AV.Player.fromFile(audioSource);
         initPlayer(player, button);
     });
 
