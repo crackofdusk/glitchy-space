@@ -28,6 +28,7 @@ var init = function(playerButton, file, buffer, visualizeCallback) {
     visualize = visualizeCallback;
     player = AV.Player.fromFile(audioSource);
     initPlayer(player, button);
+    updateInfo();
 }
 
 // Initializers
@@ -139,6 +140,11 @@ var togglePlay = function(player, button) {
     }
 
     player.togglePlayback();
+}
+
+var updateInfo = function() {
+  document.querySelector('.help').classList.add('fadeout');
+  document.querySelector('.info').classList.add('fadein');
 }
 
 var intendPlayback = function(player) {
