@@ -3,7 +3,6 @@
 function $(s) { return document.querySelector(s); }
 
 var playerButton = $(".play .button"),
-    root = $("#visualization"),
     frequencyBins = 1000,
     frequenciesBuffer = new Float32Array(frequencyBins),
     extraBuffer = new Float32Array(frequencyBins);
@@ -212,21 +211,22 @@ function setupFileChooser() {
   chooser.onchange = function(e) {
     var file = e.target.files[0];
     DemoPlayer.init(playerButton, file, frequenciesBuffer, visualize);
-    DemoPlayer.togglePlay();
   }
 
   document.body.appendChild(chooser);
 }
 
-playerButton.onclick = function() {
-    if (DemoPlayer.initialized()) {
+playerButton.addEventListener('click', function(e) {
+    e.preventDefault();
+    if (DemoPlayer.initialized() && DemoPlayer.valid()) {
         DemoPlayer.togglePlay();
-        //this.classList.toggle('pause');
+    } else if (DemoPlayer.initialized()) {
+      chooser.click();
     } else {
       setupFileChooser();
       chooser.click();
     }
-}
+}, false);
 
 
 

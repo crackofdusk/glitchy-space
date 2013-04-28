@@ -109,6 +109,10 @@ div {
     opacity: 255;
 }
 
+.warning {
+    color: #FF3700;
+}
+
 .fadeout {
   -webkit-transition: opacity 1000ms ease-in;
   -moz-transition: opacity 1000ms ease-in;

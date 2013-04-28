@@ -6,6 +6,7 @@ void function(namespace) {
 var button,
     audioSource,
 
+    valid = false,
     ready = false,
     playbackIntended = false, // user has pressed the play button
 
@@ -28,7 +29,6 @@ var init = function(playerButton, file, buffer, visualizeCallback) {
     visualize = visualizeCallback;
     player = AV.Player.fromFile(audioSource);
     initPlayer(player, button);
-    updateInfo();
 }
 
 // Initializers
@@ -42,11 +42,10 @@ var initPlayer = function(player, button) {
 
 var setupEventListeners = function(player, button) {
 
-    button.onclick = function(e) {
+    button.addEventListener('click', function(e) {
         intendPlayback(player);
-        togglePlay(player, button);
         e.preventDefault();
-    };
+    }, false);
 
     document.addEventListener('keyup', function(e) {
         e.which === 32 && togglePlay(player, button);
@@ -65,11 +64,14 @@ var setupEventListeners = function(player, button) {
     player.on('ready', function() {
         ready = true;
         console.log("Ready.");
+        togglePlay(player, button);
     });
 
     player.on('format', function(format) {
+        valid = true;
         nChannels = format.channelsPerFrame;
         sampleRate = format.sampleRate;
+        updateInfo();
     });
 
     player.on('end', function() {
@@ -79,6 +81,8 @@ var setupEventListeners = function(player, button) {
     });
 
     player.on('error', function(error) {
+        document.querySelector('.help .extra').classList.add('warning');
+        valid = false;
         throw(error);
     });
 }
@@ -169,6 +173,10 @@ namespace.togglePlay = function() {
     if (player) {
         togglePlay(player, button);
     }
+}
+
+namespace.valid = function() {
+  return valid;
 }
 
 }(DemoPlayer);
