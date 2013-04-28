@@ -2,6 +2,7 @@
 
 html {
     font-family: Helvetica, Arial, "DejaVu Sans", sans-serif;
+    color: #0D0F05;
     background-color: #fff;
 }
 
@@ -11,72 +12,82 @@ html, body {
     overflow: hidden;
 }
 
-.tile {
-    width: 48px;
-    height: 48px;
-    border: 2px solid white;
-    float: left;
-    visibility: hidden;
-}
-
-.info div {
+div {
     position: absolute;
 }
 
-
-.info .track, .info .play {
+.track, .play, .help, .info {
     border: 2px solid white;
 
     z-index: 9001;
-    
-    background: rgba(240, 240, 240, 0.6);
+
+    background: rgba(255, 255, 255, 0.8);
 }
 
-.info .track {
-    padding: 5px;
-    width: 386px;
-    height: 86px;
-    top: 200px; 
-    left: 200px; 
+.help, .info {
+    font-size: 16px;
+    padding: 10px;
+    height: 76px;
+    bottom: 48px;
+    left: 146px;
+    line-height: 1.5em;
 }
 
-.info .play {
-    width: 48px;
-    height: 48px;
+.help {
+    width: 432px;
+}
 
-    bottom: 48px; 
+.info {
+    width: 194px;
+    opacity: 0;
+}
+
+.help a, .help a:active, .help a:visited,
+.info a, .info a:active, .info a:visited {
+    color: #005A8A;
+    text-decoration: none;
+}
+
+.help span {
+  margin-left: 96px;
+}
+
+.help .arrow {
+  position: absolute;
+  left: 0;
+  margin: 0;
+  width: 96px;
+  height: 96px;
+  font-size: 96px;
+  line-height: 46px;
+}
+
+.help .description {
+  font-size: 21px;
+  font-weight: bold;
+}
+
+.track {
+    visibility: hidden;
+    width: 296px;
+    height: 96px;
+    bottom: 48px;
+    left: 144px;
+}
+
+
+.play {
+    width: 96px;
+    height: 96px;
+
+    bottom: 48px;
     left: 48px;
-}
-
-.track span {
-    display: block;
-}
-
-.track a, .track a:active, .track a:visited {
-    text-decoration:none;
-    color: #D9028B;
-}
-
-.track .title {
-    font-size: 21px;
-    color: #222;
-}
-
-.track .artist {
-    font-size: 18px;
-    color: #666;
-}
-
-.track .license {
-    position: absolute;
-    bottom: 5px;
-    font-size: 11px;
 }
 
 .play .button {
     display: block;
-    font-size: 48px;
-    line-height: 55px;
+    font-size: 96px;
+    line-height: 100px;
     text-align: center;
 }
 
@@ -89,7 +100,8 @@ html, body {
 }
 
 .play a, .play a:active, .play a:visited {
-    color: #D9028B;
+    //color: #D9028B;
+    color: #0D0F05;
 }
 
 .visible {
@@ -97,10 +109,21 @@ html, body {
     opacity: 255;
 }
 
+.warning {
+    color: #FF3700;
+}
+
 .fadeout {
-  -webkit-transition: opacity 500ms ease-out;
-  -moz-transition: opacity 500ms ease-out;
-  -o-transition: opacity 500ms ease-out;
+  -webkit-transition: opacity 1000ms ease-in;
+  -moz-transition: opacity 1000ms ease-in;
+  -o-transition: opacity 1000ms ease-in;
   opacity: 0;
+}
+
+.fadein {
+  -webkit-transition: opacity 1000ms ease 1000ms;
+  -moz-transition: opacity 1000ms ease 1000ms;
+  -o-transition: opacity 1000ms ease 1000ms;
+  opacity: 1;
 }
 
