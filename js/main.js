@@ -151,8 +151,6 @@ function updateParams(intensity) {
 }
 
 function onBeat() {
-    console.debug("Beat!");
-
     var tween = new TWEEN.Tween(camera.position)
         .to({
             x: Math.random() * 100 - 50,

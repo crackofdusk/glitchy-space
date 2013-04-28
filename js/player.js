@@ -78,7 +78,7 @@ var setupEventListeners = function(player, button) {
     });
 
     player.on('error', function(error) {
-        console.log(error);
+        throw(error);
     });
 }
 
