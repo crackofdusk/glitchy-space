@@ -4,7 +4,7 @@ This is a music visualization demo using [aurora.js](https://github.com/audiocog
 
 The code was put together quickly at a hackaton. I may or may not clean it up some day.
 
-[Online demo](http://happydawn.github.io/glitchy-space)
+[Online demo](http://crackofdusk.github.io/glitchy-space/)
 
 Note that the demo requires WebGL and Web Audio API support. If it doesn't work for you, try it in the latest version of Firefox or Chrome.
 
