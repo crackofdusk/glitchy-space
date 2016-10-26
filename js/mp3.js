@@ -1,706 +1,159 @@
-(function() {
+(function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);throw new Error("Cannot find module '"+o+"'")}var f=n[o]={exports:{}};t[o][0].call(f.exports,function(e){var n=t[o][1][e];return s(n?n:e)},f,f.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
+exports.MP3Demuxer = require('./src/demuxer');
+exports.MP3Decoder = require('./src/decoder');
 
-const ENCODINGS = ['latin1', 'utf16-bom', 'utf16-be', 'utf8'];
+},{"./src/decoder":2,"./src/demuxer":3}],2:[function(require,module,exports){
+(function (global){
+var AV = (typeof window !== "undefined" ? window['AV'] : typeof global !== "undefined" ? global['AV'] : null);
+var MP3FrameHeader = require('./header');
+var MP3Stream = require('./stream');
+var MP3Frame = require('./frame');
+var MP3Synth = require('./synth');
+var Layer1 = require('./layer1');
+var Layer2 = require('./layer2');
+var Layer3 = require('./layer3');
 
-var ID3Stream = AV.Base.extend({
-    constructor: function(header, stream) {
-        this.header = header;
-        this.stream = stream;
-        this.offset = 0;
-    },
+var MP3Decoder = AV.Decoder.extend(function() {
+    AV.Decoder.register('mp3', this);
     
-    read: function() {
-        if (!this.data) {
-            this.data = {};
-            
-            // read all frames
-            var frame;
-            while (frame = this.readFrame()) {
-                // if we already have an instance of this key, add it to an array
-                if (frame.key in this.data) {
-                    if (!Array.isArray(this.data[frame.key]))
-                        this.data[frame.key] = [this.data[frame.key]];
-                        
-                    this.data[frame.key].push(frame.value);
-                } else {
-                    this.data[frame.key] = frame.value;
-                }
-            }
-        }
-
-        return this.data;
-    },
+    this.prototype.init = function() {
+        this.mp3_stream = new MP3Stream(this.bitstream);
+        this.frame = new MP3Frame();
+        this.synth = new MP3Synth();
+        this.seeking = false;
+    };
     
-    readFrame: function() {
-        if (this.offset >= this.header.length)
-            return null;
-        
-        // get the header    
-        var header = this.readHeader();
-        var decoder = header.identifier;
-        
-        if (header.identifier.charCodeAt(0) === 0) {
-            this.offset += this.header.length + 1;
-            return null;
-        }
-        
-        // map common frame names to a single type
-        if (!this.frameTypes[decoder]) {
-            for (var key in this.map) {
-                if (this.map[key].indexOf(decoder) !== -1) {
-                    decoder = key;
+    this.prototype.readChunk = function() {
+        var stream = this.mp3_stream;
+        var frame = this.frame;
+        var synth = this.synth;
+
+        // if we just seeked, we may start getting errors involving the frame reservoir,
+        // so keep going until we successfully decode a frame
+        if (this.seeking) {
+            while (true) {
+                try {
+                    frame.decode(stream);
                     break;
+                } catch (err) {
+                    if (err instanceof AV.UnderflowError)
+                        throw err;
                 }
             }
-        }
-
-        if (this.frameTypes[decoder]) {
-            // decode the frame
-            var frame = this.decodeFrame(header, this.frameTypes[decoder]),
-                keys = Object.keys(frame);
             
-            // if it only returned one key, use that as the value    
-            if (keys.length === 1)
-                frame = frame[keys[0]];
-            
-            var result = {
-                value: frame
-            };
-            
+            this.seeking = false;
         } else {
-            // No frame type found, treat it as binary
-            var result = {
-                value: this.stream.readBuffer(Math.min(header.length, this.header.length - this.offset))
-            };
+            frame.decode(stream);
         }
-
-        result.key = this.names[header.identifier] ? this.names[header.identifier] : header.identifier;
         
-        // special sauce for cover art, which should just be a buffer
-        if (result.key === 'coverArt')
-            result.value = result.value.data;
-
-        this.offset += 10 + header.length;
-        return result;
-    },
-
-    decodeFrame: function(header, fields) {
-        var stream = this.stream,
-            start = stream.offset;
-            
-        var encoding = 0, ret = {};
-        var len = Object.keys(fields).length, i = 0;
+        synth.frame(frame);
         
-        for (var key in fields) {
-            var type = fields[key];
-            var rest = header.length - (stream.offset - start);
-            i++;
-            
-            // check for special field names
-            switch (key) {
-                case 'encoding':
-                    encoding = stream.readUInt8();
-                    continue;
+        // interleave samples
+        var data = synth.pcm.samples,
+            channels = synth.pcm.channels,
+            len = synth.pcm.length,
+            output = new Float32Array(len * channels),
+            j = 0;
+        
+        for (var k = 0; k < len; k++) {
+            for (var i = 0; i < channels; i++) {
+                output[j++] = data[i][k];
+            }
+        }
+        
+        return output;
+    };
+    
+    this.prototype.seek = function(timestamp) {
+        var offset;
+        
+        // if there was a Xing or VBRI tag with a seek table, use that
+        // otherwise guesstimate based on CBR bitrate
+        if (this.demuxer.seekPoints.length > 0) {
+            timestamp = this._super(timestamp);
+            offset = this.stream.offset;
+        } else {
+            offset = timestamp * this.format.bitrate / 8 / this.format.sampleRate;
+        }
+        
+        this.mp3_stream.reset(offset);
+        
+        // try to find 3 consecutive valid frame headers in a row
+        for (var i = 0; i < 4096; i++) {
+            var pos = offset + i;
+            for (var j = 0; j < 3; j++) {
+                this.mp3_stream.reset(pos);
                 
-                case 'language':
-                    ret.language = stream.readString(3);
-                    continue;
-            }
-            
-            // check types
-            switch (type) {                    
-                case 'latin1':
-                    ret[key] = stream.readString(i === len ? rest : null, 'latin1');
+                try {
+                    var header = MP3FrameHeader.decode(this.mp3_stream);
+                } catch (e) {
                     break;
-                    
-                case 'string':
-                    ret[key] = stream.readString(i === len ? rest : null, ENCODINGS[encoding]);
+                }
+                
+                // skip the rest of the frame
+                var size = header.framesize();
+                if (size == null)
                     break;
-                    
-                case 'binary':
-                    ret[key] = stream.readBuffer(rest)
-                    break;
-                    
-                case 'int16':
-                    ret[key] = stream.readInt16();
-                    break;
-                    
-                case 'int8':
-                    ret[key] = stream.readInt8();
-                    break;
-                    
-                case 'int24':
-                    ret[key] = stream.readInt24();
-                    break;
-                    
-                case 'int32':
-                    ret[key] = stream.readInt32();
-                    break;
-                    
-                case 'int32+':
-                    ret[key] = stream.readInt32();
-                    if (rest > 4)
-                        throw new Error('Seriously dude? Stop playing this song and get a life!');
                         
-                    break;
-                    
-                case 'date':
-                    var val = stream.readString(8);
-                    ret[key] = new Date(val.slice(0, 4), val.slice(4, 6) - 1, val.slice(6, 8));
-                    break;
-                    
-                case 'frame_id':
-                    ret[key] = stream.readString(4);
-                    break;
-                    
-                default:
-                    throw new Error('Unknown key type ' + type);
+                pos += size;
             }
-        }
-        
-        // Just in case something went wrong...
-        var rest = header.length - (stream.offset - start);
-        if (rest > 0)
-            stream.advance(rest);
-        
-        return ret;
-    }
-});
-
-// ID3 v2.3 and v2.4 support
-var ID3v23Stream = ID3Stream.extend({
-    readHeader: function() {
-        var identifier = this.stream.readString(4);        
-        var length = 0;
-        
-        if (this.header.major === 4) {
-            for (var i = 0; i < 4; i++)
-                length = (length << 7) + (this.stream.readUInt8() & 0x7f);
-        } else {
-            length = this.stream.readUInt32();
-        }
-        
-        return {
-            identifier: identifier,
-            length: length,
-            flags: this.stream.readUInt16()
-        };
-    },
-    
-    map: {
-        text: [
-            // Identification Frames
-            'TIT1', 'TIT2', 'TIT3', 'TALB', 'TOAL', 'TRCK', 'TPOS', 'TSST', 'TSRC',
-
-            // Involved Persons Frames
-            'TPE1', 'TPE2', 'TPE3', 'TPE4', 'TOPE', 'TEXT', 'TOLY', 'TCOM', 'TMCL', 'TIPL', 'TENC',
-
-            // Derived and Subjective Properties Frames
-            'TBPM', 'TLEN', 'TKEY', 'TLAN', 'TCON', 'TFLT', 'TMED', 'TMOO',
-
-            // Rights and Licence Frames
-            'TCOP', 'TPRO', 'TPUB', 'TOWN', 'TRSN', 'TRSO',
-
-            // Other Text Frames
-            'TOFN', 'TDLY', 'TDEN', 'TDOR', 'TDRC', 'TDRL', 'TDTG', 'TSSE', 'TSOA', 'TSOP', 'TSOT',
             
-            // Deprecated Text Frames
-            'TDAT', 'TIME', 'TORY', 'TRDA', 'TSIZ', 'TYER',
+            // check if we're done
+            if (j === 3)
+                break;
+        }
+        
+        // if we didn't find 3 frames, just try the first one and hope for the best
+        if (j !== 3)
+            i = 0;
             
-            // Non-standard iTunes Frames
-            'TCMP', 'TSO2', 'TSOC'
-        ],
+        this.mp3_stream.reset(offset + i);
         
-        url: [
-            'WCOM', 'WCOP', 'WOAF', 'WOAR', 'WOAS', 'WORS', 'WPAY', 'WPUB'
-        ]
-    },
-    
-    frameTypes: {        
-        text: {
-            encoding: 1,
-            value: 'string'
-        },
+        // if we guesstimated, update the timestamp to another estimate of where we actually seeked to
+        if (this.demuxer.seekPoints.length === 0)
+            timestamp = this.stream.offset / (this.format.bitrate / 8) * this.format.sampleRate;
         
-        url: {
-            value: 'latin1'
-        },
-        
-        TXXX: {
-            encoding: 1,
-            description: 'string',
-            value: 'string'
-        },
-        
-        WXXX: {
-            encoding: 1,
-            description: 'string',
-            value: 'latin1',
-        },
-        
-        USLT: {
-            encoding: 1,
-            language: 1,
-            description: 'string',
-            value: 'string'
-        },
-        
-        COMM: {
-            encoding: 1,
-            language: 1,
-            description: 'string',
-            value: 'string'
-        },
-        
-        APIC: {
-            encoding: 1,
-            mime: 'latin1',
-            type: 'int8',
-            description: 'string',
-            data: 'binary'
-        },
-        
-        UFID: {
-            owner: 'latin1',
-            identifier: 'binary'
-        },
-
-        MCDI: {
-            value: 'binary'
-        },
-        
-        PRIV: {
-            owner: 'latin1',
-            value: 'binary'
-        },
-        
-        GEOB: {
-            encoding: 1,
-            mime: 'latin1',
-            filename: 'string',
-            description: 'string',
-            data: 'binary'
-        },
-        
-        PCNT: {
-            value: 'int32+'
-        },
-        
-        POPM: {
-            email: 'latin1',
-            rating: 'int8',
-            counter: 'int32+'
-        },
-        
-        AENC: {
-            owner: 'latin1',
-            previewStart: 'int16',
-            previewLength: 'int16',
-            encryptionInfo: 'binary'
-        },
-        
-        ETCO: {
-            format: 'int8',
-            data: 'binary'  // TODO
-        },
-        
-        MLLT: {
-            framesBetweenReference: 'int16',
-            bytesBetweenReference: 'int24',
-            millisecondsBetweenReference: 'int24',
-            bitsForBytesDeviation: 'int8',
-            bitsForMillisecondsDev: 'int8',
-            data: 'binary' // TODO
-        },
-        
-        SYTC: {
-            format: 'int8',
-            tempoData: 'binary' // TODO
-        },
-        
-        SYLT: {
-            encoding: 1,
-            language: 1,
-            format: 'int8',
-            contentType: 'int8',
-            description: 'string',
-            data: 'binary' // TODO
-        },
-        
-        RVA2: {
-            identification: 'latin1',
-            data: 'binary' // TODO
-        },
-        
-        EQU2: {
-            interpolationMethod: 'int8',
-            identification: 'latin1',
-            data: 'binary' // TODO
-        },
-        
-        RVRB: {
-            left: 'int16',
-            right: 'int16',
-            bouncesLeft: 'int8',
-            bouncesRight: 'int8',
-            feedbackLL: 'int8',
-            feedbackLR: 'int8',
-            feedbackRR: 'int8',
-            feedbackRL: 'int8',
-            premixLR: 'int8',
-            premixRL: 'int8'
-        },
-        
-        RBUF: {
-            size: 'int24',
-            flag: 'int8',
-            offset: 'int32'
-        },
-        
-        LINK: {
-            identifier: 'frame_id',
-            url: 'latin1',
-            data: 'binary' // TODO stringlist?
-        },
-        
-        POSS: {
-            format: 'int8',
-            position: 'binary' // TODO
-        },
-        
-        USER: {
-            encoding: 1,
-            language: 1,
-            value: 'string'
-        },
-        
-        OWNE: {
-            encoding: 1,
-            price: 'latin1',
-            purchaseDate: 'date',
-            seller: 'string'
-        },
-        
-        COMR: {
-            encoding: 1,
-            price: 'latin1',
-            validUntil: 'date',
-            contactURL: 'latin1',
-            receivedAs: 'int8',
-            seller: 'string',
-            description: 'string',
-            logoMime: 'latin1',
-            logo: 'binary'
-        },
-        
-        ENCR: {
-            owner: 'latin1',
-            methodSymbol: 'int8',
-            data: 'binary'
-        },
-        
-        GRID: {
-            owner: 'latin1',
-            groupSymbol: 'int8',
-            data: 'binary'
-        },
-        
-        SIGN: {
-            groupSymbol: 'int8',
-            signature: 'binary'
-        },
-        
-        SEEK: {
-            value: 'int32'
-        },
-        
-        ASPI: {
-            dataStart: 'int32',
-            dataLength: 'int32',
-            numPoints: 'int16',
-            bitsPerPoint: 'int8',
-            data: 'binary' // TODO
-        },
-        
-        // Deprecated ID3 v2.3 frames
-        IPLS: {
-            encoding: 1,
-            value: 'string' // list?
-        },
-        
-        RVAD: {
-            adjustment: 'int8',
-            bits: 'int8',
-            data: 'binary' // TODO
-        },
-        
-        EQUA: {
-            adjustmentBits: 'int8',
-            data: 'binary' // TODO
-        }
-    },
-    
-    names: {
-        // Identification Frames
-        'TIT1': 'grouping',
-        'TIT2': 'title',
-        'TIT3': 'subtitle',
-        'TALB': 'album',
-        'TOAL': 'originalAlbumTitle',
-        'TRCK': 'trackNumber',
-        'TPOS': 'diskNumber',
-        'TSST': 'setSubtitle',
-        'TSRC': 'ISRC',
-
-        // Involved Persons Frames
-        'TPE1': 'artist',
-        'TPE2': 'albumArtist',
-        'TPE3': 'conductor',
-        'TPE4': 'modifiedBy',
-        'TOPE': 'originalArtist',
-        'TEXT': 'lyricist',
-        'TOLY': 'originalLyricist',
-        'TCOM': 'composer',
-        'TMCL': 'musicianCreditsList',
-        'TIPL': 'involvedPeopleList',
-        'TENC': 'encodedBy',
-
-        // Derived and Subjective Properties Frames
-        'TBPM': 'tempo',
-        'TLEN': 'length',
-        'TKEY': 'initialKey',
-        'TLAN': 'language',
-        'TCON': 'genre',
-        'TFLT': 'fileType',
-        'TMED': 'mediaType',
-        'TMOO': 'mood',
-
-        // Rights and Licence Frames
-        'TCOP': 'copyright',
-        'TPRO': 'producedNotice',
-        'TPUB': 'publisher',
-        'TOWN': 'fileOwner',
-        'TRSN': 'internetRadioStationName',
-        'TRSO': 'internetRadioStationOwner',
-
-        // Other Text Frames
-        'TOFN': 'originalFilename',
-        'TDLY': 'playlistDelay',
-        'TDEN': 'encodingTime',
-        'TDOR': 'originalReleaseTime',
-        'TDRC': 'recordingTime',
-        'TDRL': 'releaseTime',
-        'TDTG': 'taggingTime',
-        'TSSE': 'encodedWith',
-        'TSOA': 'albumSortOrder',
-        'TSOP': 'performerSortOrder',
-        'TSOT': 'titleSortOrder',
-        
-        // User defined text information
-        'TXXX': 'userText',
-        
-        // Unsynchronised lyrics/text transcription
-        'USLT': 'lyrics',
-
-        // Attached Picture Frame
-        'APIC': 'coverArt',
-
-        // Unique Identifier Frame
-        'UFID': 'uniqueIdentifier',
-
-        // Music CD Identifier Frame
-        'MCDI': 'CDIdentifier',
-
-        // Comment Frame
-        'COMM': 'comments',
-        
-        // URL link frames
-        'WCOM': 'commercialInformation',
-        'WCOP': 'copyrightInformation',
-        'WOAF': 'officialAudioFileWebpage',
-        'WOAR': 'officialArtistWebpage',
-        'WOAS': 'officialAudioSourceWebpage',
-        'WORS': 'officialInternetRadioStationHomepage',
-        'WPAY': 'payment',
-        'WPUB': 'officialPublisherWebpage',
-
-        // User Defined URL Link Frame
-        'WXXX': 'url',
-
-        'PRIV': 'private',
-        'GEOB': 'generalEncapsulatedObject',
-        'PCNT': 'playCount',
-        'POPM': 'rating',
-        'AENC': 'audioEncryption',
-        'ETCO': 'eventTimingCodes',
-        'MLLT': 'MPEGLocationLookupTable',
-        'SYTC': 'synchronisedTempoCodes',
-        'SYLT': 'synchronisedLyrics',
-        'RVA2': 'volumeAdjustment',
-        'EQU2': 'equalization',
-        'RVRB': 'reverb',
-        'RBUF': 'recommendedBufferSize',
-        'LINK': 'link',
-        'POSS': 'positionSynchronisation',
-        'USER': 'termsOfUse',
-        'OWNE': 'ownership',
-        'COMR': 'commercial',
-        'ENCR': 'encryption',
-        'GRID': 'groupIdentifier',
-        'SIGN': 'signature',
-        'SEEK': 'seek',
-        'ASPI': 'audioSeekPointIndex',
-
-        // Deprecated ID3 v2.3 frames
-        'TDAT': 'date',
-        'TIME': 'time',
-        'TORY': 'originalReleaseYear',
-        'TRDA': 'recordingDates',
-        'TSIZ': 'size',
-        'TYER': 'year',
-        'IPLS': 'involvedPeopleList',
-        'RVAD': 'volumeAdjustment',
-        'EQUA': 'equalization',
-        
-        // Non-standard iTunes frames
-        'TCMP': 'compilation',
-        'TSO2': 'albumArtistSortOrder',
-        'TSOC': 'composerSortOrder'
-    }
+        this.seeking = true;
+        return timestamp;
+    };
 });
 
-// ID3 v2.2 support
-var ID3v22Stream = ID3v23Stream.extend({    
-    readHeader: function() {
-        var id = this.stream.readString(3);
-        
-        if (this.frameReplacements[id] && !this.frameTypes[id])
-            this.frameTypes[id] = this.frameReplacements[id];
-        
-        return {
-            identifier: this.replacements[id] || id,
-            length: this.stream.readUInt24()
-        };
-    },
-    
-    // map 3 char ID3 v2.2 names to 4 char ID3 v2.3/4 names
-    replacements: {
-        'UFI': 'UFID',
-        'TT1': 'TIT1',
-        'TT2': 'TIT2',
-        'TT3': 'TIT3',
-        'TP1': 'TPE1',
-        'TP2': 'TPE2',
-        'TP3': 'TPE3',
-        'TP4': 'TPE4',
-        'TCM': 'TCOM',
-        'TXT': 'TEXT',
-        'TLA': 'TLAN',
-        'TCO': 'TCON',
-        'TAL': 'TALB',
-        'TPA': 'TPOS',
-        'TRK': 'TRCK',
-        'TRC': 'TSRC',
-        'TYE': 'TYER',
-        'TDA': 'TDAT',
-        'TIM': 'TIME',
-        'TRD': 'TRDA',
-        'TMT': 'TMED',
-        'TFT': 'TFLT',
-        'TBP': 'TBPM',
-        'TCR': 'TCOP',
-        'TPB': 'TPUB',
-        'TEN': 'TENC',
-        'TSS': 'TSSE',
-        'TOF': 'TOFN',
-        'TLE': 'TLEN',
-        'TSI': 'TSIZ',
-        'TDY': 'TDLY',
-        'TKE': 'TKEY',
-        'TOT': 'TOAL',
-        'TOA': 'TOPE',
-        'TOL': 'TOLY',
-        'TOR': 'TORY',
-        'TXX': 'TXXX',
-        
-        'WAF': 'WOAF',
-        'WAR': 'WOAR',
-        'WAS': 'WOAS',
-        'WCM': 'WCOM',
-        'WCP': 'WCOP',
-        'WPB': 'WPUB',
-        'WXX': 'WXXX',
-        
-        'IPL': 'IPLS',
-        'MCI': 'MCDI',
-        'ETC': 'ETCO',
-        'MLL': 'MLLT',
-        'STC': 'SYTC',
-        'ULT': 'USLT',
-        'SLT': 'SYLT',
-        'COM': 'COMM',
-        'RVA': 'RVAD',
-        'EQU': 'EQUA',
-        'REV': 'RVRB',
-        
-        'GEO': 'GEOB',
-        'CNT': 'PCNT',
-        'POP': 'POPM',
-        'BUF': 'RBUF',
-        'CRA': 'AENC',
-        'LNK': 'LINK',
-        
-        // iTunes stuff
-        'TST': 'TSOT',
-        'TSP': 'TSOP',
-        'TSA': 'TSOA',
-        'TCP': 'TCMP',
-        'TS2': 'TSO2',
-        'TSC': 'TSOC'
-    },
-    
-    // replacements for ID3 v2.3/4 frames
-    frameReplacements: {
-        PIC: {
-            encoding: 1,
-            format: 'int24',
-            type: 'int8',
-            description: 'string',
-            data: 'binary'
-        },
-        
-        CRM: {
-            owner: 'latin1',
-            description: 'latin1',
-            data: 'binary'
-        }
-    }
-});
+module.exports = MP3Decoder;
+
+}).call(this,typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{"./frame":4,"./header":5,"./layer1":9,"./layer2":10,"./layer3":11,"./stream":12,"./synth":13}],3:[function(require,module,exports){
+(function (global){
+var AV = (typeof window !== "undefined" ? window['AV'] : typeof global !== "undefined" ? global['AV'] : null);
+var ID3v23Stream = require('./id3').ID3v23Stream;
+var ID3v22Stream = require('./id3').ID3v22Stream;
+var MP3FrameHeader = require('./header');
+var MP3Stream = require('./stream');
+
 var MP3Demuxer = AV.Demuxer.extend(function() {
     AV.Demuxer.register(this);
-    
+
     this.probe = function(stream) {
         var off = stream.offset;
-        
+
         // skip id3 metadata if it exists
         var id3header = MP3Demuxer.getID3v2Header(stream);
         if (id3header)
             stream.advance(10 + id3header.length);
-        
+
         // attempt to read the header of the first audio frame
         var s = new MP3Stream(new AV.Bitstream(stream));
         var header = null;
-        
+
         try {
             header = MP3FrameHeader.decode(s);
         } catch (e) {};
-        
+
         // go back to the beginning, for other probes
         stream.seek(off);
-        
+
         return !!header;
     };
-    
+
     this.getID3v2Header = function(stream) {
         if (stream.peekString(0, 3) == 'ID3') {
             stream = AV.Stream.fromBuffer(stream.peekBuffer(0, 10));
@@ -712,39 +165,66 @@ var MP3Demuxer = AV.Demuxer.extend(function() {
             var bytes = stream.readBuffer(4).data;
             var length = (bytes[0] << 21) | (bytes[1] << 14) | (bytes[2] << 7) | bytes[3];
 
-            return { 
-                version: '2.' + major + '.' + minor, 
-                major: major, 
-                minor: minor, 
-                flags: flags, 
-                length: length 
+            return {
+                version: '2.' + major + '.' + minor,
+                major: major,
+                minor: minor,
+                flags: flags,
+                length: length
             };
         }
-        
+
         return null;
     };
-    
+
     const XING_OFFSETS = [[32, 17], [17, 9]];
-    this.prototype.parseDuration = function(header) {
+    this.prototype.parseDuration = function(header, off) {
         var stream = this.stream;
         var frames;
+        
+        if (this.metadata) {
+            var mllt = this.metadata.MPEGLocationLookupTable;
+            if (mllt) {
+                var bitstream = new AV.Bitstream(AV.Stream.fromBuffer(mllt.data));
+                var refSize = mllt.bitsForBytesDeviation + mllt.bitsForMillisecondsDev;
+                var samples = 0;
+                var bytes = 0;
+            
+                while (bitstream.available(refSize)) {
+                    this.addSeekPoint(bytes, samples);
+                    
+                    var bytesDev = bitstream.read(mllt.bitsForBytesDeviation);
+                    bitstream.advance(mllt.bitsForMillisecondsDev); // skip millisecond deviation
+                    
+                    bytes += mllt.bytesBetweenReference + bytesDev;
+                    samples += mllt.framesBetweenReference * header.nbsamples() * 32;
+                }
                 
+                this.addSeekPoint(bytes, samples);
+            }
+            
+            if (this.metadata.length) {
+                this.emit('duration', parseInt(this.metadata.length, 10));
+                return true;
+            }
+        }
+
         var offset = stream.offset;
         if (!header || header.layer !== 3)
             return false;
-        
+
         // Check for Xing/Info tag
-        stream.advance(XING_OFFSETS[header.flags & FLAGS.LSF_EXT ? 1 : 0][header.nchannels() === 1 ? 1 : 0]);
+        stream.advance(XING_OFFSETS[header.flags & MP3FrameHeader.FLAGS.LSF_EXT ? 1 : 0][header.nchannels() === 1 ? 1 : 0]);
         var tag = stream.readString(4);
         if (tag === 'Xing' || tag === 'Info') {
             var flags = stream.readUInt32();
-            if (flags & 1) 
+            if (flags & 1)
                 frames = stream.readUInt32();
-                
+
             if (flags & 2)
                 var size = stream.readUInt32();
-                
-            if (flags & 4 && frames && size) {
+
+            if (flags & 4 && frames && size && this.seekPoints.length === 0) {
                 for (var i = 0; i < 100; i++) {
                     var b = stream.readUInt8();
                     var pos = b / 256 * size | 0;
@@ -752,77 +232,83 @@ var MP3Demuxer = AV.Demuxer.extend(function() {
                     this.addSeekPoint(pos, time);
                 }
             }
-                
+
             if (flags & 8)
                 stream.advance(4);
-                
+
         } else {
             // Check for VBRI tag (always 32 bytes after end of mpegaudio header)
-            stream.seek(offset + 4 + 32);
+            stream.seek(off + 4 + 32);
             tag = stream.readString(4);
             if (tag == 'VBRI' && stream.readUInt16() === 1) { // Check tag version
                 stream.advance(4); // skip delay and quality
                 stream.advance(4); // skip size
                 frames = stream.readUInt32();
-                
-                var entries = stream.readUInt16();
-                var scale = stream.readUInt16();
-                var bytesPerEntry = stream.readUInt16();
-                var framesPerEntry = stream.readUInt16();
-                var fn = 'readUInt' + (bytesPerEntry * 8);
-                
-                var pos = 0;
-                for (var i = 0; i < entries; i++) {
-                    this.addSeekPoint(pos, framesPerEntry * i);
-                    pos += stream[fn]();
+
+                if (this.seekPoints.length === 0) {
+                    var entries = stream.readUInt16();
+                    var scale = stream.readUInt16();
+                    var bytesPerEntry = stream.readUInt16();
+                    var framesPerEntry = stream.readUInt16();
+                    var fn = 'readUInt' + (bytesPerEntry * 8);
+
+                    var pos = 0;
+                    for (var i = 0; i < entries; i++) {
+                        this.addSeekPoint(pos, i * framesPerEntry * header.nbsamples() * 32 | 0);
+                        pos += stream[fn]() * scale;
+                    }
                 }
             }
         }
-        
+
         if (!frames)
             return false;
-            
+
         this.emit('duration', (frames * header.nbsamples() * 32) / header.samplerate * 1000 | 0);
         return true;
     };
-    
+
     this.prototype.readChunk = function() {
         var stream = this.stream;
-        
+
         if (!this.sentInfo) {
             // read id3 metadata if it exists
             var id3header = MP3Demuxer.getID3v2Header(stream);
-            if (id3header) {
+            if (id3header && !this.metadata) {
                 stream.advance(10);
-                
+
                 if (id3header.major > 2) {
                     var id3 = new ID3v23Stream(id3header, stream);
                 } else {
                     var id3 = new ID3v22Stream(id3header, stream);
                 }
-                
-                this.emit('metadata', id3.read());
+
+                this.metadata = id3.read();
+                this.emit('metadata', this.metadata);
+                stream.seek(10 + id3header.length);
             }
-            
+
             // read the header of the first audio frame
             var off = stream.offset;
             var s = new MP3Stream(new AV.Bitstream(stream));
-            
+
             var header = MP3FrameHeader.decode(s);
             if (!header)
                 return this.emit('error', 'Could not find first frame.');
-            
+
             this.emit('format', {
                 formatID: 'mp3',
                 sampleRate: header.samplerate,
                 channelsPerFrame: header.nchannels(),
                 bitrate: header.bitrate,
-                floatingPoint: true
+                floatingPoint: true,
+                layer: header.layer,
+                flags: header.flags
             });
-            
-            var sentDuration = this.parseDuration(header);
+
+            var sentDuration = this.parseDuration(header, off);
             stream.advance(off - stream.offset);
-            
+
             // if there were no Xing/VBRI tags, guesstimate the duration based on data size and bitrate
             this.dataSize = 0;
             if (!sentDuration) {
@@ -830,62 +316,78 @@ var MP3Demuxer = AV.Demuxer.extend(function() {
                     this.emit('duration', this.dataSize * 8 / header.bitrate * 1000 | 0);
                 });
             }
-            
+
             this.sentInfo = true;
         }
-        
+
         while (stream.available(1)) {
             var buffer = stream.readSingleBuffer(stream.remainingBytes());
             this.dataSize += buffer.length;
             this.emit('data', buffer);
         }
     };
-});function MP3Stream(stream) {
-    this.stream = stream;                     // actual bitstream
-    this.sync = false;                        // stream sync found
-    this.freerate = 0;                        // free bitrate (fixed)
-    this.this_frame = stream.stream.offset;   // start of current frame
-    this.next_frame = stream.stream.offset;   // start of next frame
-    
-    this.main_data = new Uint8Array(BUFFER_MDLEN); // actual audio data
-    this.md_len = 0;                               // length of main data
-    
-    // copy methods from actual stream
-    for (var key in stream) {
-        if (typeof stream[key] === 'function')
-            this[key] = stream[key].bind(stream);
-    }
+});
+
+module.exports = MP3Demuxer;
+
+}).call(this,typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{"./header":5,"./id3":7,"./stream":12}],4:[function(require,module,exports){
+var MP3FrameHeader = require('./header');
+var utils = require('./utils');
+
+function MP3Frame() {
+    this.header = null;                     // MPEG audio header
+    this.options = 0;                       // decoding options (from stream)
+    this.sbsample = utils.makeArray([2, 36, 32]); // synthesis subband filter samples
+    this.overlap = utils.makeArray([2, 32, 18]);  // Layer III block overlap data
+    this.decoders = [];
 }
 
-MP3Stream.prototype.getU8 = function(offset) {
-    var stream = this.stream.stream;
-    return stream.peekUInt8(offset - stream.offset);
-};
+// included layer decoders are registered here
+MP3Frame.layers = [];
 
-MP3Stream.prototype.nextByte = function() {
-    var stream = this.stream;
-    return stream.bitPosition === 0 ? stream.stream.offset : stream.stream.offset + 1;
-};
+MP3Frame.prototype.decode = function(stream) {
+    if (!this.header || !(this.header.flags & MP3FrameHeader.FLAGS.INCOMPLETE))
+        this.header = MP3FrameHeader.decode(stream);
 
-MP3Stream.prototype.doSync = function() {
-    var stream = this.stream.stream;
-    this.align();
+    this.header.flags &= ~MP3FrameHeader.FLAGS.INCOMPLETE;
     
-    while (this.available(16) && !(stream.peekUInt8(0) === 0xff && (stream.peekUInt8(1) & 0xe0) === 0xe0)) {
-        this.advance(8);
+    // make an instance of the decoder for this layer if needed
+    var decoder = this.decoders[this.header.layer - 1];
+    if (!decoder) {
+        var Layer = MP3Frame.layers[this.header.layer];
+        if (!Layer)
+            throw new Error("Layer " + this.header.layer + " is not supported.");
+            
+        decoder = this.decoders[this.header.layer - 1] = new Layer();
     }
-
-    if (!this.available(BUFFER_GUARD))
-        return false;
-        
-    return true;
+    
+    decoder.decode(stream, this);
 };
 
-MP3Stream.prototype.reset = function(byteOffset) {
-    this.seek(byteOffset * 8);
-    this.next_frame = byteOffset;
-    this.sync = true;
-};const BITRATES = [
+module.exports = MP3Frame;
+
+},{"./header":5,"./utils":15}],5:[function(require,module,exports){
+(function (global){
+var AV = (typeof window !== "undefined" ? window['AV'] : typeof global !== "undefined" ? global['AV'] : null);
+
+function MP3FrameHeader() {
+    this.layer          = 0; // audio layer (1, 2, or 3)
+    this.mode           = 0; // channel mode (see above)
+    this.mode_extension = 0; // additional mode info
+    this.emphasis       = 0; // de-emphasis to use (see above)
+
+    this.bitrate        = 0; // stream bitrate (bps)
+    this.samplerate     = 0; // sampling frequency (Hz)
+
+    this.crc_check      = 0; // frame CRC accumulator
+    this.crc_target     = 0; // final target CRC checksum
+
+    this.flags          = 0; // flags (see above)
+    this.private_bits   = 0; // private bits
+}
+
+const BITRATES = [
     // MPEG-1
     [ 0,  32000,  64000,  96000, 128000, 160000, 192000, 224000,  // Layer I
          256000, 288000, 320000, 352000, 384000, 416000, 448000 ],
@@ -905,7 +407,7 @@ const SAMPLERATES = [
     44100, 48000, 32000 
 ];
 
-const FLAGS = {
+MP3FrameHeader.FLAGS = {
     NPRIVATE_III: 0x0007,   // number of Layer III private bits
     INCOMPLETE  : 0x0008,   // header but not data is decoded
 
@@ -928,7 +430,7 @@ const PRIVATE = {
     III     : 0x001f  // Layer III private bits (up to 5)
 };
 
-const MODE = {
+MP3FrameHeader.MODE = {
     SINGLE_CHANNEL: 0, // single channel
     DUAL_CHANNEL  : 1, // dual channel
     JOINT_STEREO  : 2, // joint (MS/intensity) stereo
@@ -942,24 +444,8 @@ const EMPHASIS = {
     RESERVED  : 2  // unknown emphasis
 };
 
-const BUFFER_GUARD = 8;
-const BUFFER_MDLEN = (511 + 2048 + BUFFER_GUARD);
-
-function MP3FrameHeader() {
-    this.layer          = 0; // audio layer (1, 2, or 3)
-    this.mode           = 0; // channel mode (see above)
-    this.mode_extension = 0; // additional mode info
-    this.emphasis       = 0; // de-emphasis to use (see above)
-
-    this.bitrate        = 0; // stream bitrate (bps)
-    this.samplerate     = 0; // sampling frequency (Hz)
-
-    this.crc_check      = 0; // frame CRC accumulator
-    this.crc_target     = 0; // final target CRC checksum
-
-    this.flags          = 0; // flags (see above)
-    this.private_bits   = 0; // private bits
-}
+MP3FrameHeader.BUFFER_GUARD = 8;
+MP3FrameHeader.BUFFER_MDLEN = (511 + 2048 + MP3FrameHeader.BUFFER_GUARD);
 
 MP3FrameHeader.prototype.copy = function() {
     var clone = new MP3FrameHeader();
@@ -977,14 +463,14 @@ MP3FrameHeader.prototype.nchannels = function () {
 };
 
 MP3FrameHeader.prototype.nbsamples = function() {
-    return (this.layer === 1 ? 12 : ((this.layer === 3 && (this.flags & FLAGS.LSF_EXT)) ? 18 : 36));
+    return (this.layer === 1 ? 12 : ((this.layer === 3 && (this.flags & MP3FrameHeader.FLAGS.LSF_EXT)) ? 18 : 36));
 };
 
 MP3FrameHeader.prototype.framesize = function() {
     if (this.bitrate === 0)
         return null;
     
-    var padding = (this.flags & FLAGS.PADDING ? 1 : 0);
+    var padding = (this.flags & MP3FrameHeader.FLAGS.PADDING ? 1 : 0);
     switch (this.layer) {
         case 1:
             var size = (this.bitrate * 12) / this.samplerate | 0;
@@ -996,7 +482,7 @@ MP3FrameHeader.prototype.framesize = function() {
             
         case 3:
         default:
-            var lsf = this.flags & FLAGS.LSF_EXT ? 1 : 0;
+            var lsf = this.flags & MP3FrameHeader.FLAGS.LSF_EXT ? 1 : 0;
             var size = (this.bitrate * 144) / (this.samplerate << lsf) | 0;
             return size + padding;
     }
@@ -1011,12 +497,12 @@ MP3FrameHeader.prototype.decode = function(stream) {
 
     // MPEG 2.5 indicator (really part of syncword) 
     if (stream.read(1) === 0)
-        this.flags |= FLAGS.MPEG_2_5_EXT;
+        this.flags |= MP3FrameHeader.FLAGS.MPEG_2_5_EXT;
 
     // ID 
     if (stream.read(1) === 0) {
-        this.flags |= FLAGS.LSF_EXT;
-    } else if (this.flags & FLAGS.MPEG_2_5_EXT) {
+        this.flags |= MP3FrameHeader.FLAGS.LSF_EXT;
+    } else if (this.flags & MP3FrameHeader.FLAGS.MPEG_2_5_EXT) {
         throw new AV.UnderflowError(); // LOSTSYNC
     }
 
@@ -1028,14 +514,14 @@ MP3FrameHeader.prototype.decode = function(stream) {
 
     // protection_bit 
     if (stream.read(1) === 0)
-        this.flags |= FLAGS.PROTECTION;
+        this.flags |= MP3FrameHeader.FLAGS.PROTECTION;
 
     // bitrate_index 
     var index = stream.read(4);
     if (index === 15)
         throw new Error('Invalid bitrate');
 
-    if (this.flags & FLAGS.LSF_EXT) {
+    if (this.flags & MP3FrameHeader.FLAGS.LSF_EXT) {
         this.bitrate = BITRATES[3 + (this.layer >> 1)][index];
     } else {
         this.bitrate = BITRATES[this.layer - 1][index];
@@ -1048,16 +534,16 @@ MP3FrameHeader.prototype.decode = function(stream) {
 
     this.samplerate = SAMPLERATES[index];
 
-    if (this.flags & FLAGS.LSF_EXT) {
+    if (this.flags & MP3FrameHeader.FLAGS.LSF_EXT) {
         this.samplerate /= 2;
 
-        if (this.flags & FLAGS.MPEG_2_5_EXT)
+        if (this.flags & MP3FrameHeader.FLAGS.MPEG_2_5_EXT)
             this.samplerate /= 2;
     }
 
     // padding_bit 
     if (stream.read(1))
-        this.flags |= FLAGS.PADDING;
+        this.flags |= MP3FrameHeader.FLAGS.PADDING;
 
     // private_bit 
     if (stream.read(1))
@@ -1071,17 +557,17 @@ MP3FrameHeader.prototype.decode = function(stream) {
 
     // copyright 
     if (stream.read(1))
-        this.flags |= FLAGS.COPYRIGHT;
+        this.flags |= MP3FrameHeader.FLAGS.COPYRIGHT;
 
     // original/copy 
     if (stream.read(1))
-        this.flags |= FLAGS.ORIGINAL;
+        this.flags |= MP3FrameHeader.FLAGS.ORIGINAL;
 
     // emphasis 
     this.emphasis = stream.read(2);
 
     // crc_check 
-    if (this.flags & FLAGS.PROTECTION)
+    if (this.flags & MP3FrameHeader.FLAGS.PROTECTION)
         this.crc_target = stream.read(16);
 };
 
@@ -1095,7 +581,7 @@ MP3FrameHeader.decode = function(stream) {
         syncing = false;
         
         if (stream.sync) {
-            if (!stream.available(BUFFER_GUARD)) {
+            if (!stream.available(MP3FrameHeader.BUFFER_GUARD)) {
                 stream.next_frame = ptr;
                 throw new AV.UnderflowError();
             } else if (!(stream.getU8(ptr) === 0xff && (stream.getU8(ptr + 1) & 0xe0) === 0xe0)) {
@@ -1126,21 +612,21 @@ MP3FrameHeader.decode = function(stream) {
                 MP3FrameHeader.free_bitrate(stream, header);
             
             header.bitrate = stream.freerate;
-            header.flags |= FLAGS.FREEFORMAT;
+            header.flags |= MP3FrameHeader.FLAGS.FREEFORMAT;
         }
         
         // calculate beginning of next frame
-        var pad_slot = (header.flags & FLAGS.PADDING) ? 1 : 0;
+        var pad_slot = (header.flags & MP3FrameHeader.FLAGS.PADDING) ? 1 : 0;
         
         if (header.layer === 1) {
             var N = (((12 * header.bitrate / header.samplerate) << 0) + pad_slot) * 4;
         } else {
-            var slots_per_frame = (header.layer === 3 && (header.flags & FLAGS.LSF_EXT)) ? 72 : 144;
+            var slots_per_frame = (header.layer === 3 && (header.flags & MP3FrameHeader.FLAGS.LSF_EXT)) ? 72 : 144;
             var N = ((slots_per_frame * header.bitrate / header.samplerate) << 0) + pad_slot;
         }
         
         // verify there is enough data left in buffer to decode this frame
-        if (!stream.available(N + BUFFER_GUARD)) {
+        if (!stream.available(N + MP3FrameHeader.BUFFER_GUARD)) {
             stream.next_frame = stream.this_frame;
             throw new AV.UnderflowError();
         }
@@ -1163,13 +649,13 @@ MP3FrameHeader.decode = function(stream) {
         }
     }
     
-    header.flags |= FLAGS.INCOMPLETE;
+    header.flags |= MP3FrameHeader.FLAGS.INCOMPLETE;
     return header;
 };
 
 MP3FrameHeader.free_bitrate = function(stream, header) {
-    var pad_slot = header.flags & FLAGS.PADDING ? 1 : 0,
-        slots_per_frame = header.layer === 3 && header.flags & FLAGS.LSF_EXT ? 72 : 144;
+    var pad_slot = header.flags & MP3FrameHeader.FLAGS.PADDING ? 1 : 0,
+        slots_per_frame = header.layer === 3 && header.flags & MP3FrameHeader.FLAGS.LSF_EXT ? 72 : 144;
     
     var start = stream.offset();
     var rate = 0;
@@ -1201,1910 +687,11 @@ MP3FrameHeader.free_bitrate = function(stream, header) {
     
     stream.freerate = rate * 1000;
 };
-function MP3Frame() {
-    this.header = null;                     // MPEG audio header
-    this.options = 0;                       // decoding options (from stream)
-    this.sbsample = makeArray([2, 36, 32]); // synthesis subband filter samples
-    this.overlap = makeArray([2, 32, 18]);  // Layer III block overlap data
-    this.decoders = [];
-}
 
-function makeArray(lengths, Type) {
-    if (!Type) Type = Float64Array;
-    
-    if (lengths.length === 1) {
-        return new Type(lengths[0]);
-    }
-    
-    var ret = [],
-        len = lengths[0];
-        
-    for (var j = 0; j < len; j++) {
-        ret[j] = makeArray(lengths.slice(1), Type);
-    }
-    
-    return ret;
-}
+module.exports = MP3FrameHeader;
 
-// included layer decoders are registered here
-MP3Frame.layers = [];
-
-MP3Frame.prototype.decode = function(stream) {
-    if (!this.header || !(this.header.flags & FLAGS.INCOMPLETE))
-        this.header = MP3FrameHeader.decode(stream);
-
-    this.header.flags &= ~FLAGS.INCOMPLETE;
-    
-    // make an instance of the decoder for this layer if needed
-    var decoder = this.decoders[this.header.layer - 1];
-    if (!decoder) {
-        var Layer = MP3Frame.layers[this.header.layer];
-        if (!Layer)
-            throw new Error("Layer " + this.header.layer + " is not supported.");
-            
-        decoder = this.decoders[this.header.layer - 1] = new Layer();
-    }
-    
-    decoder.decode(stream, this);
-};function MP3Synth() {
-    this.filter = makeArray([2, 2, 2, 16, 8]); // polyphase filterbank outputs
-    this.phase = 0;
-    
-    this.pcm = {
-        samplerate: 0,
-        channels: 0,
-        length: 0,
-        samples: [new Float64Array(1152), new Float64Array(1152)]
-    };
-}
-
-/* costab[i] = cos(PI / (2 * 32) * i) */
-const costab1  = 0.998795456;
-const costab2  = 0.995184727;
-const costab3  = 0.989176510;
-const costab4  = 0.980785280;
-const costab5  = 0.970031253;
-const costab6  = 0.956940336;
-const costab7  = 0.941544065;
-const costab8  = 0.923879533;
-const costab9  = 0.903989293;
-const costab10 = 0.881921264;
-const costab11 = 0.857728610;
-const costab12 = 0.831469612;
-const costab13 = 0.803207531;
-const costab14 = 0.773010453;
-const costab15 = 0.740951125;
-const costab16 = 0.707106781;
-const costab17 = 0.671558955;
-const costab18 = 0.634393284;
-const costab19 = 0.595699304;
-const costab20 = 0.555570233;
-const costab21 = 0.514102744;
-const costab22 = 0.471396737;
-const costab23 = 0.427555093;
-const costab24 = 0.382683432;
-const costab25 = 0.336889853;
-const costab26 = 0.290284677;
-const costab27 = 0.242980180;
-const costab28 = 0.195090322;
-const costab29 = 0.146730474;
-const costab30 = 0.098017140;
-const costab31 = 0.049067674;
-
-/*
- * NAME:    dct32()
- * DESCRIPTION: perform fast in[32].out[32] DCT
- */
-MP3Synth.dct32 = function (_in, slot, lo, hi) {
-    var t0,   t1,   t2,   t3,   t4,   t5,   t6,   t7;
-    var t8,   t9,   t10,  t11,  t12,  t13,  t14,  t15;
-    var t16,  t17,  t18,  t19,  t20,  t21,  t22,  t23;
-    var t24,  t25,  t26,  t27,  t28,  t29,  t30,  t31;
-    var t32,  t33,  t34,  t35,  t36,  t37,  t38,  t39;
-    var t40,  t41,  t42,  t43,  t44,  t45,  t46,  t47;
-    var t48,  t49,  t50,  t51,  t52,  t53,  t54,  t55;
-    var t56,  t57,  t58,  t59,  t60,  t61,  t62,  t63;
-    var t64,  t65,  t66,  t67,  t68,  t69,  t70,  t71;
-    var t72,  t73,  t74,  t75,  t76,  t77,  t78,  t79;
-    var t80,  t81,  t82,  t83,  t84,  t85,  t86,  t87;
-    var t88,  t89,  t90,  t91,  t92,  t93,  t94,  t95;
-    var t96,  t97,  t98,  t99,  t100, t101, t102, t103;
-    var t104, t105, t106, t107, t108, t109, t110, t111;
-    var t112, t113, t114, t115, t116, t117, t118, t119;
-    var t120, t121, t122, t123, t124, t125, t126, t127;
-    var t128, t129, t130, t131, t132, t133, t134, t135;
-    var t136, t137, t138, t139, t140, t141, t142, t143;
-    var t144, t145, t146, t147, t148, t149, t150, t151;
-    var t152, t153, t154, t155, t156, t157, t158, t159;
-    var t160, t161, t162, t163, t164, t165, t166, t167;
-    var t168, t169, t170, t171, t172, t173, t174, t175;
-    var t176;
-
-    t0   = _in[0]  + _in[31];  t16  = ((_in[0]  - _in[31]) * (costab1));
-    t1   = _in[15] + _in[16];  t17  = ((_in[15] - _in[16]) * (costab31));
-
-    t41  = t16 + t17;
-    t59  = ((t16 - t17) * (costab2));
-    t33  = t0  + t1;
-    t50  = ((t0  - t1) * ( costab2));
-
-    t2   = _in[7]  + _in[24];  t18  = ((_in[7]  - _in[24]) * (costab15));
-    t3   = _in[8]  + _in[23];  t19  = ((_in[8]  - _in[23]) * (costab17));
-
-    t42  = t18 + t19;
-    t60  = ((t18 - t19) * (costab30));
-    t34  = t2  + t3;
-    t51  = ((t2  - t3) * ( costab30));
-
-    t4   = _in[3]  + _in[28];  t20  = ((_in[3]  - _in[28]) * (costab7));
-    t5   = _in[12] + _in[19];  t21  = ((_in[12] - _in[19]) * (costab25));
-
-    t43  = t20 + t21;
-    t61  = ((t20 - t21) * (costab14));
-    t35  = t4  + t5;
-    t52  = ((t4  - t5) * ( costab14));
-
-    t6   = _in[4]  + _in[27];  t22  = ((_in[4]  - _in[27]) * (costab9));
-    t7   = _in[11] + _in[20];  t23  = ((_in[11] - _in[20]) * (costab23));
-
-    t44  = t22 + t23;
-    t62  = ((t22 - t23) * (costab18));
-    t36  = t6  + t7;
-    t53  = ((t6  - t7) * ( costab18));
-
-    t8   = _in[1]  + _in[30];  t24  = ((_in[1]  - _in[30]) * (costab3));
-    t9   = _in[14] + _in[17];  t25  = ((_in[14] - _in[17]) * (costab29));
-
-    t45  = t24 + t25;
-    t63  = ((t24 - t25) * (costab6));
-    t37  = t8  + t9;
-    t54  = ((t8  - t9) * ( costab6));
-
-    t10  = _in[6]  + _in[25];  t26  = ((_in[6]  - _in[25]) * (costab13));
-    t11  = _in[9]  + _in[22];  t27  = ((_in[9]  - _in[22]) * (costab19));
-
-    t46  = t26 + t27;
-    t64  = ((t26 - t27) * (costab26));
-    t38  = t10 + t11;
-    t55  = ((t10 - t11) * (costab26));
-
-    t12  = _in[2]  + _in[29];  t28  = ((_in[2]  - _in[29]) * (costab5));
-    t13  = _in[13] + _in[18];  t29  = ((_in[13] - _in[18]) * (costab27));
-
-    t47  = t28 + t29;
-    t65  = ((t28 - t29) * (costab10));
-    t39  = t12 + t13;
-    t56  = ((t12 - t13) * (costab10));
-
-    t14  = _in[5]  + _in[26];  t30  = ((_in[5]  - _in[26]) * (costab11));
-    t15  = _in[10] + _in[21];  t31  = ((_in[10] - _in[21]) * (costab21));
-
-    t48  = t30 + t31;
-    t66  = ((t30 - t31) * (costab22));
-    t40  = t14 + t15;
-    t57  = ((t14 - t15) * (costab22));
-
-    t69  = t33 + t34;  t89  = ((t33 - t34) * (costab4));
-    t70  = t35 + t36;  t90  = ((t35 - t36) * (costab28));
-    t71  = t37 + t38;  t91  = ((t37 - t38) * (costab12));
-    t72  = t39 + t40;  t92  = ((t39 - t40) * (costab20));
-    t73  = t41 + t42;  t94  = ((t41 - t42) * (costab4));
-    t74  = t43 + t44;  t95  = ((t43 - t44) * (costab28));
-    t75  = t45 + t46;  t96  = ((t45 - t46) * (costab12));
-    t76  = t47 + t48;  t97  = ((t47 - t48) * (costab20));
-
-    t78  = t50 + t51;  t100 = ((t50 - t51) * (costab4));
-    t79  = t52 + t53;  t101 = ((t52 - t53) * (costab28));
-    t80  = t54 + t55;  t102 = ((t54 - t55) * (costab12));
-    t81  = t56 + t57;  t103 = ((t56 - t57) * (costab20));
-
-    t83  = t59 + t60;  t106 = ((t59 - t60) * (costab4));
-    t84  = t61 + t62;  t107 = ((t61 - t62) * (costab28));
-    t85  = t63 + t64;  t108 = ((t63 - t64) * (costab12));
-    t86  = t65 + t66;  t109 = ((t65 - t66) * (costab20));
-
-    t113 = t69  + t70;
-    t114 = t71  + t72;
-
-    /*  0 */ hi[15][slot] = t113 + t114;
-    /* 16 */ lo[ 0][slot] = ((t113 - t114) * (costab16));
-
-    t115 = t73  + t74;
-    t116 = t75  + t76;
-
-    t32  = t115 + t116;
-
-    /*  1 */ hi[14][slot] = t32;
-
-    t118 = t78  + t79;
-    t119 = t80  + t81;
-
-    t58  = t118 + t119;
-
-    /*  2 */ hi[13][slot] = t58;
-
-    t121 = t83  + t84;
-    t122 = t85  + t86;
-
-    t67  = t121 + t122;
-
-    t49  = (t67 * 2) - t32;
-
-    /*  3 */ hi[12][slot] = t49;
-
-    t125 = t89  + t90;
-    t126 = t91  + t92;
-
-    t93  = t125 + t126;
-
-    /*  4 */ hi[11][slot] = t93;
-
-    t128 = t94  + t95;
-    t129 = t96  + t97;
-
-    t98  = t128 + t129;
-
-    t68  = (t98 * 2) - t49;
-
-    /*  5 */ hi[10][slot] = t68;
-
-    t132 = t100 + t101;
-    t133 = t102 + t103;
-
-    t104 = t132 + t133;
-
-    t82  = (t104 * 2) - t58;
-
-    /*  6 */ hi[ 9][slot] = t82;
-
-    t136 = t106 + t107;
-    t137 = t108 + t109;
-
-    t110 = t136 + t137;
-
-    t87  = (t110 * 2) - t67;
-
-    t77  = (t87 * 2) - t68;
-
-    /*  7 */ hi[ 8][slot] = t77;
-
-    t141 = ((t69 - t70) * (costab8));
-    t142 = ((t71 - t72) * (costab24));
-    t143 = t141 + t142;
-
-    /*  8 */ hi[ 7][slot] = t143;
-    /* 24 */ lo[ 8][slot] =
-        (((t141 - t142) * (costab16) * 2)) - t143;
-
-    t144 = ((t73 - t74) * (costab8));
-    t145 = ((t75 - t76) * (costab24));
-    t146 = t144 + t145;
-
-    t88  = (t146 * 2) - t77;
-
-    /*  9 */ hi[ 6][slot] = t88;
-
-    t148 = ((t78 - t79) * (costab8));
-    t149 = ((t80 - t81) * (costab24));
-    t150 = t148 + t149;
-
-    t105 = (t150 * 2) - t82;
-
-    /* 10 */ hi[ 5][slot] = t105;
-
-    t152 = ((t83 - t84) * (costab8));
-    t153 = ((t85 - t86) * (costab24));
-    t154 = t152 + t153;
-
-    t111 = (t154 * 2) - t87;
-
-    t99  = (t111 * 2) - t88;
-
-    /* 11 */ hi[ 4][slot] = t99;
-
-    t157 = ((t89 - t90) * (costab8));
-    t158 = ((t91 - t92) * (costab24));
-    t159 = t157 + t158;
-
-    t127 = (t159 * 2) - t93;
-
-    /* 12 */ hi[ 3][slot] = t127;
-
-    t160 = (((t125 - t126) * (costab16) * 2)) - t127;
-
-    /* 20 */ lo[ 4][slot] = t160;
-    /* 28 */ lo[12][slot] =
-        (((((t157 - t158) * (costab16) * 2) - t159) * 2)) - t160;
-
-    t161 = ((t94 - t95) * (costab8));
-    t162 = ((t96 - t97) * (costab24));
-    t163 = t161 + t162;
-
-    t130 = (t163 * 2) - t98;
-
-    t112 = (t130 * 2) - t99;
-
-    /* 13 */ hi[ 2][slot] = t112;
-
-    t164 = (((t128 - t129) * (costab16) * 2)) - t130;
-
-    t166 = ((t100 - t101) * (costab8));
-    t167 = ((t102 - t103) * (costab24));
-    t168 = t166 + t167;
-
-    t134 = (t168 * 2) - t104;
-
-    t120 = (t134 * 2) - t105;
-
-    /* 14 */ hi[ 1][slot] = t120;
-
-    t135 = (((t118 - t119) * (costab16) * 2)) - t120;
-
-    /* 18 */ lo[ 2][slot] = t135;
-
-    t169 = (((t132 - t133) * (costab16) * 2)) - t134;
-
-    t151 = (t169 * 2) - t135;
-
-    /* 22 */ lo[ 6][slot] = t151;
-
-    t170 = (((((t148 - t149) * (costab16) * 2) - t150) * 2)) - t151;
-
-    /* 26 */ lo[10][slot] = t170;
-    /* 30 */ lo[14][slot] =
-        (((((((t166 - t167) * (costab16)) * 2 -
-             t168) * 2) - t169) * 2) - t170);
-
-    t171 = ((t106 - t107) * (costab8));
-    t172 = ((t108 - t109) * (costab24));
-    t173 = t171 + t172;
-
-    t138 = (t173 * 2) - t110;
-    t123 = (t138 * 2) - t111;
-    t139 = (((t121 - t122) * (costab16) * 2)) - t123;
-    t117 = (t123 * 2) - t112;
-
-    /* 15 */ hi[ 0][slot] = t117;
-
-    t124 = (((t115 - t116) * (costab16) * 2)) - t117;
-
-    /* 17 */ lo[ 1][slot] = t124;
-
-    t131 = (t139 * 2) - t124;
-
-    /* 19 */ lo[ 3][slot] = t131;
-
-    t140 = (t164 * 2) - t131;
-
-    /* 21 */ lo[ 5][slot] = t140;
-
-    t174 = (((t136 - t137) * (costab16) * 2)) - t138;
-    t155 = (t174 * 2) - t139;
-    t147 = (t155 * 2) - t140;
-
-    /* 23 */ lo[ 7][slot] = t147;
-
-    t156 = (((((t144 - t145) * (costab16) * 2) - t146) * 2)) - t147;
-
-    /* 25 */ lo[ 9][slot] = t156;
-
-    t175 = (((((t152 - t153) * (costab16) * 2) - t154) * 2)) - t155;
-    t165 = (t175 * 2) - t156;
-
-    /* 27 */ lo[11][slot] = t165;
-
-    t176 = (((((((t161 - t162) * (costab16) * 2)) -
-               t163) * 2) - t164) * 2) - t165;
-
-    /* 29 */ lo[13][slot] = t176;
-    /* 31 */ lo[15][slot] =
-        (((((((((t171 - t172) * (costab16)) * 2 -
-               t173) * 2) - t174) * 2) - t175) * 2) - t176);
-
-    /*
-     * Totals:
-     *  80 multiplies
-     *  80 additions
-     * 119 subtractions
-     *  49 shifts (not counting SSO)
-     */
-};
-
-/*
- * These are the coefficients for the subband synthesis window. This is a
- * reordered version of Table B.3 from ISO/IEC 11172-3.
- */
-const D = [
-    [  0.000000000,   /*  0 */
-       -0.000442505,
-       0.003250122,
-       -0.007003784,
-       0.031082153,
-       -0.078628540,
-       0.100311279,
-       -0.572036743,
-       1.144989014,
-       0.572036743,
-       0.100311279,
-       0.078628540,
-       0.031082153,
-       0.007003784,
-       0.003250122,
-       0.000442505,
-
-       0.000000000,
-       -0.000442505,
-       0.003250122,
-       -0.007003784,
-       0.031082153,
-       -0.078628540,
-       0.100311279,
-       -0.572036743,
-       1.144989014,
-       0.572036743,
-       0.100311279,
-       0.078628540,
-       0.031082153,
-       0.007003784,
-       0.003250122,
-       0.000442505 ],
-
-    [ -0.000015259,   /*  1 */
-      -0.000473022,
-      0.003326416,
-      -0.007919312,
-      0.030517578,
-      -0.084182739,
-      0.090927124,
-      -0.600219727,
-      1.144287109,
-      0.543823242,
-      0.108856201,
-      0.073059082,
-      0.031478882,
-      0.006118774,
-      0.003173828,
-      0.000396729,
-
-      -0.000015259,
-      -0.000473022,
-      0.003326416,
-      -0.007919312,
-      0.030517578,
-      -0.084182739,
-      0.090927124,
-      -0.600219727,
-      1.144287109,
-      0.543823242,
-      0.108856201,
-      0.073059082,
-      0.031478882,
-      0.006118774,
-      0.003173828,
-      0.000396729 ],
-
-    [ -0.000015259,   /*  2 */
-      -0.000534058,
-      0.003387451,
-      -0.008865356,
-      0.029785156,
-      -0.089706421,
-      0.080688477,
-      -0.628295898,
-      1.142211914,
-      0.515609741,
-      0.116577148,
-      0.067520142,
-      0.031738281,
-      0.005294800,
-      0.003082275,
-      0.000366211,
-
-      -0.000015259,
-      -0.000534058,
-      0.003387451,
-      -0.008865356,
-      0.029785156,
-      -0.089706421,
-      0.080688477,
-      -0.628295898,
-      1.142211914,
-      0.515609741,
-      0.116577148,
-      0.067520142,
-      0.031738281,
-      0.005294800,
-      0.003082275,
-      0.000366211 ],
-
-    [ -0.000015259,   /*  3 */
-      -0.000579834,
-      0.003433228,
-      -0.009841919,
-      0.028884888,
-      -0.095169067,
-      0.069595337,
-      -0.656219482,
-      1.138763428,
-      0.487472534,
-      0.123474121,
-      0.061996460,
-      0.031845093,
-      0.004486084,
-      0.002990723,
-      0.000320435,
-
-      -0.000015259,
-      -0.000579834,
-      0.003433228,
-      -0.009841919,
-      0.028884888,
-      -0.095169067,
-      0.069595337,
-      -0.656219482,
-      1.138763428,
-      0.487472534,
-      0.123474121,
-      0.061996460,
-      0.031845093,
-      0.004486084,
-      0.002990723,
-      0.000320435 ],
-
-    [ -0.000015259,   /*  4 */
-      -0.000625610,
-      0.003463745,
-      -0.010848999,
-      0.027801514,
-      -0.100540161,
-      0.057617187,
-      -0.683914185,
-      1.133926392,
-      0.459472656,
-      0.129577637,
-      0.056533813,
-      0.031814575,
-      0.003723145,
-      0.002899170,
-      0.000289917,
-
-      -0.000015259,
-      -0.000625610,
-      0.003463745,
-      -0.010848999,
-      0.027801514,
-      -0.100540161,
-      0.057617187,
-      -0.683914185,
-      1.133926392,
-      0.459472656,
-      0.129577637,
-      0.056533813,
-      0.031814575,
-      0.003723145,
-      0.002899170,
-      0.000289917 ],
-
-    [ -0.000015259,   /*  5 */
-      -0.000686646,
-      0.003479004,
-      -0.011886597,
-      0.026535034,
-      -0.105819702,
-      0.044784546,
-      -0.711318970,
-      1.127746582,
-      0.431655884,
-      0.134887695,
-      0.051132202,
-      0.031661987,
-      0.003005981,
-      0.002792358,
-      0.000259399,
-
-      -0.000015259,
-      -0.000686646,
-      0.003479004,
-      -0.011886597,
-      0.026535034,
-      -0.105819702,
-      0.044784546,
-      -0.711318970,
-      1.127746582,
-      0.431655884,
-      0.134887695,
-      0.051132202,
-      0.031661987,
-      0.003005981,
-      0.002792358,
-      0.000259399 ],
-
-    [ -0.000015259,   /*  6 */
-      -0.000747681,
-      0.003479004,
-      -0.012939453,
-      0.025085449,
-      -0.110946655,
-      0.031082153,
-      -0.738372803,
-      1.120223999,
-      0.404083252,
-      0.139450073,
-      0.045837402,
-      0.031387329,
-      0.002334595,
-      0.002685547,
-      0.000244141,
-
-      -0.000015259,
-      -0.000747681,
-      0.003479004,
-      -0.012939453,
-      0.025085449,
-      -0.110946655,
-      0.031082153,
-      -0.738372803,
-      1.120223999,
-      0.404083252,
-      0.139450073,
-      0.045837402,
-      0.031387329,
-      0.002334595,
-      0.002685547,
-      0.000244141 ],
-
-    [ -0.000030518,   /*  7 */
-      -0.000808716,
-      0.003463745,
-      -0.014022827,
-      0.023422241,
-      -0.115921021,
-      0.016510010,
-      -0.765029907,
-      1.111373901,
-      0.376800537,
-      0.143264771,
-      0.040634155,
-      0.031005859,
-      0.001693726,
-      0.002578735,
-      0.000213623,
-
-      -0.000030518,
-      -0.000808716,
-      0.003463745,
-      -0.014022827,
-      0.023422241,
-      -0.115921021,
-      0.016510010,
-      -0.765029907,
-      1.111373901,
-      0.376800537,
-      0.143264771,
-      0.040634155,
-      0.031005859,
-      0.001693726,
-      0.002578735,
-      0.000213623 ],
-
-    [ -0.000030518,   /*  8 */
-      -0.000885010,
-      0.003417969,
-      -0.015121460,
-      0.021575928,
-      -0.120697021,
-      0.001068115,
-      -0.791213989,
-      1.101211548,
-      0.349868774,
-      0.146362305,
-      0.035552979,
-      0.030532837,
-      0.001098633,
-      0.002456665,
-      0.000198364,
-
-      -0.000030518,
-      -0.000885010,
-      0.003417969,
-      -0.015121460,
-      0.021575928,
-      -0.120697021,
-      0.001068115,
-      -0.791213989,
-      1.101211548,
-      0.349868774,
-      0.146362305,
-      0.035552979,
-      0.030532837,
-      0.001098633,
-      0.002456665,
-      0.000198364 ],
-
-    [ -0.000030518,   /*  9 */
-      -0.000961304,
-      0.003372192,
-      -0.016235352,
-      0.019531250,
-      -0.125259399,
-      -0.015228271,
-      -0.816864014,
-      1.089782715,
-      0.323318481,
-      0.148773193,
-      0.030609131,
-      0.029937744,
-      0.000549316,
-      0.002349854,
-      0.000167847,
-
-      -0.000030518,
-      -0.000961304,
-      0.003372192,
-      -0.016235352,
-      0.019531250,
-      -0.125259399,
-      -0.015228271,
-      -0.816864014,
-      1.089782715,
-      0.323318481,
-      0.148773193,
-      0.030609131,
-      0.029937744,
-      0.000549316,
-      0.002349854,
-      0.000167847 ],
-
-    [ -0.000030518,   /* 10 */
-      -0.001037598,
-      0.003280640,
-      -0.017349243,
-      0.017257690,
-      -0.129562378,
-      -0.032379150,
-      -0.841949463,
-      1.077117920,
-      0.297210693,
-      0.150497437,
-      0.025817871,
-      0.029281616,
-      0.000030518,
-      0.002243042,
-      0.000152588,
-
-      -0.000030518,
-      -0.001037598,
-      0.003280640,
-      -0.017349243,
-      0.017257690,
-      -0.129562378,
-      -0.032379150,
-      -0.841949463,
-      1.077117920,
-      0.297210693,
-      0.150497437,
-      0.025817871,
-      0.029281616,
-      0.000030518,
-      0.002243042,
-      0.000152588 ],
-
-    [ -0.000045776,   /* 11 */
-      -0.001113892,
-      0.003173828,
-      -0.018463135,
-      0.014801025,
-      -0.133590698,
-      -0.050354004,
-      -0.866363525,
-      1.063217163,
-      0.271591187,
-      0.151596069,
-      0.021179199,
-      0.028533936,
-      -0.000442505,
-      0.002120972,
-      0.000137329,
-
-      -0.000045776,
-      -0.001113892,
-      0.003173828,
-      -0.018463135,
-      0.014801025,
-      -0.133590698,
-      -0.050354004,
-      -0.866363525,
-      1.063217163,
-      0.271591187,
-      0.151596069,
-      0.021179199,
-      0.028533936,
-      -0.000442505,
-      0.002120972,
-      0.000137329 ],
-
-    [ -0.000045776,   /* 12 */
-      -0.001205444,
-      0.003051758,
-      -0.019577026,
-      0.012115479,
-      -0.137298584,
-      -0.069168091,
-      -0.890090942,
-      1.048156738,
-      0.246505737,
-      0.152069092,
-      0.016708374,
-      0.027725220,
-      -0.000869751,
-      0.002014160,
-      0.000122070,
-
-      -0.000045776,
-      -0.001205444,
-      0.003051758,
-      -0.019577026,
-      0.012115479,
-      -0.137298584,
-      -0.069168091,
-      -0.890090942,
-      1.048156738,
-      0.246505737,
-      0.152069092,
-      0.016708374,
-      0.027725220,
-      -0.000869751,
-      0.002014160,
-      0.000122070 ],
-
-    [ -0.000061035,   /* 13 */
-      -0.001296997,
-      0.002883911,
-      -0.020690918,
-      0.009231567,
-      -0.140670776,
-      -0.088775635,
-      -0.913055420,
-      1.031936646,
-      0.221984863,
-      0.151962280,
-      0.012420654,
-      0.026840210,
-      -0.001266479,
-      0.001907349,
-      0.000106812,
-
-      -0.000061035,
-      -0.001296997,
-      0.002883911,
-      -0.020690918,
-      0.009231567,
-      -0.140670776,
-      -0.088775635,
-      -0.913055420,
-      1.031936646,
-      0.221984863,
-      0.151962280,
-      0.012420654,
-      0.026840210,
-      -0.001266479,
-      0.001907349,
-      0.000106812 ],
-
-    [ -0.000061035,   /* 14 */
-      -0.001388550,
-      0.002700806,
-      -0.021789551,
-      0.006134033,
-      -0.143676758,
-      -0.109161377,
-      -0.935195923,
-      1.014617920,
-      0.198059082,
-      0.151306152,
-      0.008316040,
-      0.025909424,
-      -0.001617432,
-      0.001785278,
-      0.000106812,
-
-      -0.000061035,
-      -0.001388550,
-      0.002700806,
-      -0.021789551,
-      0.006134033,
-      -0.143676758,
-      -0.109161377,
-      -0.935195923,
-      1.014617920,
-      0.198059082,
-      0.151306152,
-      0.008316040,
-      0.025909424,
-      -0.001617432,
-      0.001785278,
-      0.000106812 ],
-
-    [ -0.000076294,   /* 15 */
-      -0.001480103,
-      0.002487183,
-      -0.022857666,
-      0.002822876,
-      -0.146255493,
-      -0.130310059,
-      -0.956481934,
-      0.996246338,
-      0.174789429,
-      0.150115967,
-      0.004394531,
-      0.024932861,
-      -0.001937866,
-      0.001693726,
-      0.000091553,
-
-      -0.000076294,
-      -0.001480103,
-      0.002487183,
-      -0.022857666,
-      0.002822876,
-      -0.146255493,
-      -0.130310059,
-      -0.956481934,
-      0.996246338,
-      0.174789429,
-      0.150115967,
-      0.004394531,
-      0.024932861,
-      -0.001937866,
-      0.001693726,
-      0.000091553 ],
-
-    [ -0.000076294,   /* 16 */
-      -0.001586914,
-      0.002227783,
-      -0.023910522,
-      -0.000686646,
-      -0.148422241,
-      -0.152206421,
-      -0.976852417,
-      0.976852417,
-      0.152206421,
-      0.148422241,
-      0.000686646,
-      0.023910522,
-      -0.002227783,
-      0.001586914,
-      0.000076294,
-
-      -0.000076294,
-      -0.001586914,
-      0.002227783,
-      -0.023910522,
-      -0.000686646,
-      -0.148422241,
-      -0.152206421,
-      -0.976852417,
-      0.976852417,
-      0.152206421,
-      0.148422241,
-      0.000686646,
-      0.023910522,
-      -0.002227783,
-      0.001586914,
-      0.000076294 ]
-];
-
-/*
- * perform full frequency PCM synthesis
- */
-MP3Synth.prototype.full = function(frame, nch, ns) {
-    var Dptr, hi, lo, ptr;
-    
-    for (var ch = 0; ch < nch; ++ch) {
-        var sbsample = frame.sbsample[ch];
-        var filter  = this.filter[ch];
-        var phase   = this.phase;
-        var pcm     = this.pcm.samples[ch];
-        var pcm1Ptr = 0;
-        var pcm2Ptr = 0;
-
-        for (var s = 0; s < ns; ++s) {
-            MP3Synth.dct32(sbsample[s], phase >> 1, filter[0][phase & 1], filter[1][phase & 1]);
-
-            var pe = phase & ~1;
-            var po = ((phase - 1) & 0xf) | 1;
-
-            /* calculate 32 samples */
-            var fe = filter[0][ phase & 1];
-            var fx = filter[0][~phase & 1];
-            var fo = filter[1][~phase & 1];
-
-            var fePtr = 0;
-            var fxPtr = 0;
-            var foPtr = 0;
-            
-            Dptr = 0;
-
-            ptr = D[Dptr];
-            _fx = fx[fxPtr];
-            _fe = fe[fePtr];
-
-            lo =  _fx[0] * ptr[po +  0];
-            lo += _fx[1] * ptr[po + 14];
-            lo += _fx[2] * ptr[po + 12];
-            lo += _fx[3] * ptr[po + 10];
-            lo += _fx[4] * ptr[po +  8];
-            lo += _fx[5] * ptr[po +  6];
-            lo += _fx[6] * ptr[po +  4];
-            lo += _fx[7] * ptr[po +  2];
-            lo = -lo;                      
-            
-            lo += _fe[0] * ptr[pe +  0];
-            lo += _fe[1] * ptr[pe + 14];
-            lo += _fe[2] * ptr[pe + 12];
-            lo += _fe[3] * ptr[pe + 10];
-            lo += _fe[4] * ptr[pe +  8];
-            lo += _fe[5] * ptr[pe +  6];
-            lo += _fe[6] * ptr[pe +  4];
-            lo += _fe[7] * ptr[pe +  2];
-
-            pcm[pcm1Ptr++] = lo;
-            pcm2Ptr = pcm1Ptr + 30;
-
-            for (var sb = 1; sb < 16; ++sb) {
-                ++fePtr;
-                ++Dptr;
-
-                /* D[32 - sb][i] === -D[sb][31 - i] */
-
-                ptr = D[Dptr];
-                _fo = fo[foPtr];
-                _fe = fe[fePtr];
-
-                lo  = _fo[0] * ptr[po +  0];
-                lo += _fo[1] * ptr[po + 14];
-                lo += _fo[2] * ptr[po + 12];
-                lo += _fo[3] * ptr[po + 10];
-                lo += _fo[4] * ptr[po +  8];
-                lo += _fo[5] * ptr[po +  6];
-                lo += _fo[6] * ptr[po +  4];
-                lo += _fo[7] * ptr[po +  2];
-                lo = -lo;
-
-                lo += _fe[7] * ptr[pe + 2];
-                lo += _fe[6] * ptr[pe + 4];
-                lo += _fe[5] * ptr[pe + 6];
-                lo += _fe[4] * ptr[pe + 8];
-                lo += _fe[3] * ptr[pe + 10];
-                lo += _fe[2] * ptr[pe + 12];
-                lo += _fe[1] * ptr[pe + 14];
-                lo += _fe[0] * ptr[pe + 0];
-
-                pcm[pcm1Ptr++] = lo;
-
-                lo =  _fe[0] * ptr[-pe + 31 - 16];
-                lo += _fe[1] * ptr[-pe + 31 - 14];
-                lo += _fe[2] * ptr[-pe + 31 - 12];
-                lo += _fe[3] * ptr[-pe + 31 - 10];
-                lo += _fe[4] * ptr[-pe + 31 -  8];
-                lo += _fe[5] * ptr[-pe + 31 -  6];
-                lo += _fe[6] * ptr[-pe + 31 -  4];
-                lo += _fe[7] * ptr[-pe + 31 -  2];
-
-                lo += _fo[7] * ptr[-po + 31 -  2];
-                lo += _fo[6] * ptr[-po + 31 -  4];
-                lo += _fo[5] * ptr[-po + 31 -  6];
-                lo += _fo[4] * ptr[-po + 31 -  8];
-                lo += _fo[3] * ptr[-po + 31 - 10];
-                lo += _fo[2] * ptr[-po + 31 - 12];
-                lo += _fo[1] * ptr[-po + 31 - 14];
-                lo += _fo[0] * ptr[-po + 31 - 16];
-
-                pcm[pcm2Ptr--] = lo;
-                ++foPtr;
-            }
-
-            ++Dptr;
-
-            ptr = D[Dptr];
-            _fo = fo[foPtr];
-
-            lo  = _fo[0] * ptr[po +  0];
-            lo += _fo[1] * ptr[po + 14];
-            lo += _fo[2] * ptr[po + 12];
-            lo += _fo[3] * ptr[po + 10];
-            lo += _fo[4] * ptr[po +  8];
-            lo += _fo[5] * ptr[po +  6];
-            lo += _fo[6] * ptr[po +  4];
-            lo += _fo[7] * ptr[po +  2];
-
-            pcm[pcm1Ptr] = -lo;
-            pcm1Ptr += 16;
-            phase = (phase + 1) % 16;
-        }
-    }
-};
-
-// TODO: synth.half()
-
-/*
- * NAME:    synth.frame()
- * DESCRIPTION: perform PCM synthesis of frame subband samples
- */
-MP3Synth.prototype.frame = function (frame) {
-    var nch = frame.header.nchannels();
-    var ns  = frame.header.nbsamples();
-
-    this.pcm.samplerate = frame.header.samplerate;
-    this.pcm.channels   = nch;
-    this.pcm.length     = 32 * ns;
-
-    /*
-     if (frame.options & Mad.Option.HALFSAMPLERATE) {
-     this.pcm.samplerate /= 2;
-     this.pcm.length     /= 2;
-
-     throw new Error("HALFSAMPLERATE is not supported. What do you think? As if I have the time for this");
-     }
-     */
-
-    this.full(frame, nch, ns);
-    this.phase = (this.phase + ns) % 16;
-};
-/*
- * These are the scalefactor values for Layer I and Layer II.
- * The values are from Table B.1 of ISO/IEC 11172-3.
- *
- * Strictly speaking, Table B.1 has only 63 entries (0-62), thus a strict
- * interpretation of ISO/IEC 11172-3 would suggest that a scalefactor index of
- * 63 is invalid. However, for better compatibility with current practices, we
- * add a 64th entry.
- */
-const SF_TABLE = new Float32Array([
-    2.000000000000, 1.587401051968, 1.259921049895, 1.000000000000, 
-    0.793700525984, 0.629960524947, 0.500000000000, 0.396850262992,
-    0.314980262474, 0.250000000000, 0.198425131496, 0.157490131237,
-    0.125000000000, 0.099212565748, 0.078745065618, 0.062500000000,
-    0.049606282874, 0.039372532809, 0.031250000000, 0.024803141437,
-    0.019686266405, 0.015625000000, 0.012401570719, 0.009843133202,
-    0.007812500000, 0.006200785359, 0.004921566601, 0.003906250000,
-    0.003100392680, 0.002460783301, 0.001953125000, 0.001550196340,
-    0.001230391650, 0.000976562500, 0.000775098170, 0.000615195825,
-    0.000488281250, 0.000387549085, 0.000307597913, 0.000244140625,
-    0.000193774542, 0.000153798956, 0.000122070313, 0.000096887271,
-    0.000076899478, 0.000061035156, 0.000048443636, 0.000038449739,
-    0.000030517578, 0.000024221818, 0.000019224870, 0.000015258789,
-    0.000012110909, 0.000009612435, 0.000007629395, 0.000006055454,
-    0.000004806217, 0.000003814697, 0.000003027727, 0.000002403109,
-    0.000001907349, 0.000001513864, 0.000001201554, 0.000000000000
-]);
-
-/*
- * MPEG-1 scalefactor band widths
- * derived from Table B.8 of ISO/IEC 11172-3
- */
-const SFB_48000_LONG = new Uint8Array([
-    4,  4,  4,  4,  4,  4,  6,  6,  6,   8,  10,
-    12, 16, 18, 22, 28, 34, 40, 46, 54,  54, 192
-]);
-
-const SFB_44100_LONG = new Uint8Array([
-    4,  4,  4,  4,  4,  4,  6,  6,  8,   8,  10,
-    12, 16, 20, 24, 28, 34, 42, 50, 54,  76, 158
-]);
-
-const SFB_32000_LONG = new Uint8Array([
-    4,  4,  4,  4,  4,  4,  6,  6,  8,  10,  12,
-    16, 20, 24, 30, 38, 46, 56, 68, 84, 102,  26
-]);
-
-const SFB_48000_SHORT = new Uint8Array([
-    4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  6,
-    6,  6,  6,  6,  6, 10, 10, 10, 12, 12, 12, 14, 14,
-    14, 16, 16, 16, 20, 20, 20, 26, 26, 26, 66, 66, 66
-]);
-
-const SFB_44100_SHORT = new Uint8Array([
-    4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  6,
-    6,  6,  8,  8,  8, 10, 10, 10, 12, 12, 12, 14, 14,
-    14, 18, 18, 18, 22, 22, 22, 30, 30, 30, 56, 56, 56
-]);
-
-const SFB_32000_SHORT = new Uint8Array([
-    4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  6,
-    6,  6,  8,  8,  8, 12, 12, 12, 16, 16, 16, 20, 20,
-    20, 26, 26, 26, 34, 34, 34, 42, 42, 42, 12, 12, 12
-]);
-
-const SFB_48000_MIXED = new Uint8Array([
-    /* long */   4,  4,  4,  4,  4,  4,  6,  6,
-    /* short */  4,  4,  4,  6,  6,  6,  6,  6,  6, 10,
-    10, 10, 12, 12, 12, 14, 14, 14, 16, 16,
-    16, 20, 20, 20, 26, 26, 26, 66, 66, 66
-]);
-
-const SFB_44100_MIXED = new Uint8Array([
-    /* long */   4,  4,  4,  4,  4,  4,  6,  6,
-    /* short */  4,  4,  4,  6,  6,  6,  8,  8,  8, 10,
-    10, 10, 12, 12, 12, 14, 14, 14, 18, 18,
-    18, 22, 22, 22, 30, 30, 30, 56, 56, 56
-]);
-
-const SFB_32000_MIXED = new Uint8Array([
-    /* long */   4,  4,  4,  4,  4,  4,  6,  6,
-    /* short */  4,  4,  4,  6,  6,  6,  8,  8,  8, 12,
-    12, 12, 16, 16, 16, 20, 20, 20, 26, 26,
-    26, 34, 34, 34, 42, 42, 42, 12, 12, 12
-]);
-
-/*
- * MPEG-2 scalefactor band widths
- * derived from Table B.2 of ISO/IEC 13818-3
- */
-const SFB_24000_LONG = new Uint8Array([
-    6,  6,  6,  6,  6,  6,  8, 10, 12,  14,  16,
-   18, 22, 26, 32, 38, 46, 54, 62, 70,  76,  36
-]);
-
-const SFB_22050_LONG = new Uint8Array([
-    6,  6,  6,  6,  6,  6,  8, 10, 12,  14,  16,
-   20, 24, 28, 32, 38, 46, 52, 60, 68,  58,  54
-]);
-
-const SFB_16000_LONG = SFB_22050_LONG;
-
-const SFB_24000_SHORT = new Uint8Array([
-   4,  4,  4,  4,  4,  4,  4,  4,  4,  6,  6,  6,  8,
-   8,  8, 10, 10, 10, 12, 12, 12, 14, 14, 14, 18, 18,
-  18, 24, 24, 24, 32, 32, 32, 44, 44, 44, 12, 12, 12
-]);
-
-const SFB_22050_SHORT = new Uint8Array([
-   4,  4,  4,  4,  4,  4,  4,  4,  4,  6,  6,  6,  6,
-   6,  6,  8,  8,  8, 10, 10, 10, 14, 14, 14, 18, 18,
-  18, 26, 26, 26, 32, 32, 32, 42, 42, 42, 18, 18, 18
-]);
-
-const SFB_16000_SHORT = new Uint8Array([
-   4,  4,  4,  4,  4,  4,  4,  4,  4,  6,  6,  6,  8,
-   8,  8, 10, 10, 10, 12, 12, 12, 14, 14, 14, 18, 18,
-  18, 24, 24, 24, 30, 30, 30, 40, 40, 40, 18, 18, 18
-]);
-
-const SFB_24000_MIXED = new Uint8Array([
-  /* long */   6,  6,  6,  6,  6,  6,
-  /* short */  6,  6,  6,  8,  8,  8, 10, 10, 10, 12,
-              12, 12, 14, 14, 14, 18, 18, 18, 24, 24,
-              24, 32, 32, 32, 44, 44, 44, 12, 12, 12
-]);
-
-const SFB_22050_MIXED = new Uint8Array([
-  /* long */   6,  6,  6,  6,  6,  6,
-  /* short */  6,  6,  6,  6,  6,  6,  8,  8,  8, 10,
-              10, 10, 14, 14, 14, 18, 18, 18, 26, 26,
-              26, 32, 32, 32, 42, 42, 42, 18, 18, 18
-]);
-
-const SFB_16000_MIXED = new Uint8Array([
-  /* long */   6,  6,  6,  6,  6,  6,
-  /* short */  6,  6,  6,  8,  8,  8, 10, 10, 10, 12,
-              12, 12, 14, 14, 14, 18, 18, 18, 24, 24,
-              24, 30, 30, 30, 40, 40, 40, 18, 18, 18
-]);
-
-/*
- * MPEG 2.5 scalefactor band widths
- * derived from public sources
- */
-const SFB_12000_LONG = SFB_16000_LONG;
-const SFB_11025_LONG = SFB_12000_LONG;
-
-const SFB_8000_LONG = new Uint8Array([
-  12, 12, 12, 12, 12, 12, 16, 20, 24,  28,  32,
-  40, 48, 56, 64, 76, 90,  2,  2,  2,   2,   2
-]);
-
-const SFB_12000_SHORT = SFB_16000_SHORT;
-const SFB_11025_SHORT = SFB_12000_SHORT;
-
-const SFB_8000_SHORT = new Uint8Array([
-   8,  8,  8,  8,  8,  8,  8,  8,  8, 12, 12, 12, 16,
-  16, 16, 20, 20, 20, 24, 24, 24, 28, 28, 28, 36, 36,
-  36,  2,  2,  2,  2,  2,  2,  2,  2,  2, 26, 26, 26
-]);
-
-const SFB_12000_MIXED = SFB_16000_MIXED;
-const SFB_11025_MIXED = SFB_12000_MIXED;
-
-/* the 8000 Hz short block scalefactor bands do not break after
-   the first 36 frequency lines, so this is probably wrong */
-const SFB_8000_MIXED = new Uint8Array([
-  /* long */  12, 12, 12,
-  /* short */  4,  4,  4,  8,  8,  8, 12, 12, 12, 16, 16, 16,
-              20, 20, 20, 24, 24, 24, 28, 28, 28, 36, 36, 36,
-               2,  2,  2,  2,  2,  2,  2,  2,  2, 26, 26, 26
-]);
-
-const SFBWIDTH_TABLE = [
-    { l: SFB_48000_LONG, s: SFB_48000_SHORT, m: SFB_48000_MIXED },
-    { l: SFB_44100_LONG, s: SFB_44100_SHORT, m: SFB_44100_MIXED },
-    { l: SFB_32000_LONG, s: SFB_32000_SHORT, m: SFB_32000_MIXED },
-    { l: SFB_24000_LONG, s: SFB_24000_SHORT, m: SFB_24000_MIXED },
-    { l: SFB_22050_LONG, s: SFB_22050_SHORT, m: SFB_22050_MIXED },
-    { l: SFB_16000_LONG, s: SFB_16000_SHORT, m: SFB_16000_MIXED },
-    { l: SFB_12000_LONG, s: SFB_12000_SHORT, m: SFB_12000_MIXED },
-    { l: SFB_11025_LONG, s: SFB_11025_SHORT, m: SFB_11025_MIXED },
-    { l:  SFB_8000_LONG, s:  SFB_8000_SHORT, m:  SFB_8000_MIXED }
-];
-
-const PRETAB = new Uint8Array([
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 3, 2, 0
-]);
-
-/*
- * fractional powers of two
- * used for requantization and joint stereo decoding
- *
- * ROOT_TABLE[3 + x] = 2^(x/4)
- */
-const ROOT_TABLE = new Float32Array([
-    /* 2^(-3/4) */ 0.59460355750136,
-    /* 2^(-2/4) */ 0.70710678118655,
-    /* 2^(-1/4) */ 0.84089641525371,
-    /* 2^( 0/4) */ 1.00000000000000,
-    /* 2^(+1/4) */ 1.18920711500272,
-    /* 2^(+2/4) */ 1.41421356237310,
-    /* 2^(+3/4) */ 1.68179283050743
-]);
-
-const CS = new Float32Array([
-    +0.857492926 , +0.881741997,
-    +0.949628649 , +0.983314592,
-    +0.995517816 , +0.999160558,
-    +0.999899195 , +0.999993155
-]);
-
-const CA = new Float32Array([
-    -0.514495755, -0.471731969,
-    -0.313377454, -0.181913200,
-    -0.094574193, -0.040965583,
-    -0.014198569, -0.003699975
-]);
-
-const COUNT1TABLE_SELECT = 0x01;
-const SCALEFAC_SCALE     = 0x02;
-const PREFLAG            = 0x04;
-const MIXED_BLOCK_FLAG   = 0x08;
-
-const I_STEREO  = 0x1;
-const MS_STEREO = 0x2;
-
-/*
- * windowing coefficients for long blocks
- * derived from section 2.4.3.4.10.3 of ISO/IEC 11172-3
- *
- * WINDOW_L[i] = sin((PI / 36) * (i + 1/2))
- */
-const WINDOW_L = new Float32Array([
-    0.043619387, 0.130526192,
-    0.216439614, 0.300705800,
-    0.382683432, 0.461748613,
-    0.537299608, 0.608761429,
-    0.675590208, 0.737277337,
-    0.793353340, 0.843391446,
-
-    0.887010833, 0.923879533,
-    0.953716951, 0.976296007,
-    0.991444861, 0.999048222,
-    0.999048222, 0.991444861,
-    0.976296007, 0.953716951,
-    0.923879533, 0.887010833,
-
-    0.843391446, 0.793353340,
-    0.737277337, 0.675590208,
-    0.608761429, 0.537299608,
-    0.461748613, 0.382683432,
-    0.300705800, 0.216439614,
-    0.130526192, 0.043619387
-]);
-
-/*
- * windowing coefficients for short blocks
- * derived from section 2.4.3.4.10.3 of ISO/IEC 11172-3
- *
- * WINDOW_S[i] = sin((PI / 12) * (i + 1/2))
- */
-const WINDOW_S = new Float32Array([
-    0.130526192, 0.382683432,
-    0.608761429, 0.793353340,
-    0.923879533, 0.991444861,
-    0.991444861, 0.923879533,
-    0.793353340, 0.608761429,
-    0.382683432, 0.130526192
-]);
-
-/*
- * coefficients for intensity stereo processing
- * derived from section 2.4.3.4.9.3 of ISO/IEC 11172-3
- *
- * is_ratio[i] = tan(i * (PI / 12))
- * IS_TABLE[i] = is_ratio[i] / (1 + is_ratio[i])
- */
-const IS_TABLE = new Float32Array([
-    0.000000000,
-    0.211324865,
-    0.366025404,
-    0.500000000,
-    0.633974596,
-    0.788675135,
-    1.000000000
-]);
-
-/*
- * coefficients for LSF intensity stereo processing
- * derived from section 2.4.3.2 of ISO/IEC 13818-3
- *
- * IS_LSF_TABLE[0][i] = (1 / sqrt(sqrt(2)))^(i + 1)
- * IS_LSF_TABLE[1][i] = (1 /      sqrt(2)) ^(i + 1)
- */
-const IS_LSF_TABLE = [
-    new Float32Array([
-        0.840896415,
-        0.707106781,
-        0.594603558,
-        0.500000000,
-        0.420448208,
-        0.353553391,
-        0.297301779,
-        0.250000000,
-        0.210224104,
-        0.176776695,
-        0.148650889,
-        0.125000000,
-        0.105112052,
-        0.088388348,
-        0.074325445
-    ]), 
-    new Float32Array([
-        0.707106781,
-        0.500000000,
-        0.353553391,
-        0.250000000,
-        0.176776695,
-        0.125000000,
-        0.088388348,
-        0.062500000,
-        0.044194174,
-        0.031250000,
-        0.022097087,
-        0.015625000,
-        0.011048543,
-        0.007812500,
-        0.005524272
-    ])
-];
-
-/*
- * scalefactor bit lengths
- * derived from section 2.4.2.7 of ISO/IEC 11172-3
- */
-const SFLEN_TABLE = [
-    { slen1: 0, slen2: 0 }, { slen1: 0, slen2: 1 }, { slen1: 0, slen2: 2 }, { slen1: 0, slen2: 3 },
-    { slen1: 3, slen2: 0 }, { slen1: 1, slen2: 1 }, { slen1: 1, slen2: 2 }, { slen1: 1, slen2: 3 },
-    { slen1: 2, slen2: 1 }, { slen1: 2, slen2: 2 }, { slen1: 2, slen2: 3 }, { slen1: 3, slen2: 1 },
-    { slen1: 3, slen2: 2 }, { slen1: 3, slen2: 3 }, { slen1: 4, slen2: 2 }, { slen1: 4, slen2: 3 }    
-];
-
-/*
- * number of LSF scalefactor band values
- * derived from section 2.4.3.2 of ISO/IEC 13818-3
- */
-const NSFB_TABLE = [
-    [ [  6,  5,  5, 5 ],
-      [  9,  9,  9, 9 ],
-      [  6,  9,  9, 9 ] ],
-
-    [ [  6,  5,  7, 3 ],
-      [  9,  9, 12, 6 ],
-      [  6,  9, 12, 6 ] ],
-
-    [ [ 11, 10,  0, 0 ],
-      [ 18, 18,  0, 0 ],
-      [ 15, 18,  0, 0 ] ],
-
-    [ [  7,  7,  7, 0 ],
-      [ 12, 12, 12, 0 ],
-      [  6, 15, 12, 0 ] ],
-
-    [ [  6,  6,  6, 3 ],
-      [ 12,  9,  9, 6 ],
-      [  6, 12,  9, 6 ] ],
-
-    [ [  8,  8,  5, 0 ],
-      [ 15, 12,  9, 0 ],
-      [  6, 18,  9, 0 ] ]
- ];
-function Layer1() {    
-    this.allocation = makeArray([2, 32], Uint8Array);
-    this.scalefactor = makeArray([2, 32], Uint8Array);
-}
-
-MP3Frame.layers[1] = Layer1;
-
-// linear scaling table
-const LINEAR_TABLE = new Float32Array([
-    1.33333333333333, 1.14285714285714, 1.06666666666667,
-    1.03225806451613, 1.01587301587302, 1.00787401574803,
-    1.00392156862745, 1.00195694716243, 1.00097751710655,
-    1.00048851978505, 1.00024420024420, 1.00012208521548,
-    1.00006103888177, 1.00003051850948
-]);
-
-Layer1.prototype.decode = function(stream, frame) {
-    var header = frame.header;
-    var nch = header.nchannels();
-    
-    var bound = 32;
-    if (header.mode === MODE.JOINT_STEREO) {
-        header.flags |= FLAGS.I_STEREO;
-        bound = 4 + header.mode_extension * 4;
-    }
-    
-    if (header.flags & FLAGS.PROTECTION) {
-        // TODO: crc check
-    }
-    
-    // decode bit allocations
-    var allocation = this.allocation;
-    for (var sb = 0; sb < bound; sb++) {
-        for (var ch = 0; ch < nch; ch++) {
-            var nb = stream.read(4);
-            if (nb === 15)
-                throw new Error("forbidden bit allocation value");
-                
-            allocation[ch][sb] = nb ? nb + 1 : 0;
-        }
-    }
-    
-    for (var sb = bound; sb < 32; sb++) {
-        var nb = stream.read(4);
-        if (nb === 15)
-            throw new Error("forbidden bit allocation value");
-            
-        allocation[0][sb] =
-        allocation[1][sb] = nb ? nb + 1 : 0;
-    }
-    
-    // decode scalefactors
-    var scalefactor = this.scalefactor;
-    for (var sb = 0; sb < 32; sb++) {
-        for (var ch = 0; ch < nch; ch++) {
-            if (allocation[ch][sb]) {
-                scalefactor[ch][sb] = stream.read(6);
-                
-            	/*
-            	 * Scalefactor index 63 does not appear in Table B.1 of
-            	 * ISO/IEC 11172-3. Nonetheless, other implementations accept it,
-                 * so we do as well 
-                 */
-            }
-        }
-    }
-    
-    // decode samples
-    for (var s = 0; s < 12; s++) {
-        for (var sb = 0; sb < bound; sb++) {
-            for (var ch = 0; ch < nch; ch++) {
-                var nb = allocation[ch][sb];
-                frame.sbsample[ch][s][sb] = nb ? this.sample(stream, nb) * SF_TABLE[scalefactor[ch][sb]] : 0;
-            }
-        }
-        
-        for (var sb = bound; sb < 32; sb++) {
-            var nb = allocation[0][sb];
-            if (nb) {
-                var sample = this.sample(stream, nb);
-                
-                for (var ch = 0; ch < nch; ch++) {
-                    frame.sbsample[ch][s][sb] = sample * SF_TABLE[scalefactor[ch][sb]];
-                }
-            } else {
-                for (var ch = 0; ch < nch; ch++) {
-                    frame.sbsample[ch][s][sb] = 0;
-                }
-            }
-        }
-    }
-};
-
-Layer1.prototype.sample = function(stream, nb) {
-    var sample = stream.read(nb);
-    
-    // invert most significant bit, and form a 2's complement sample
-    sample ^= 1 << (nb - 1);
-    sample |= -(sample & (1 << (nb - 1)));
-    sample /= (1 << (nb - 1));
-        
-    // requantize the sample
-    // s'' = (2^nb / (2^nb - 1)) * (s''' + 2^(-nb + 1))
-    sample += 1 >> (nb - 1);
-    return sample * LINEAR_TABLE[nb - 2];
-};
-function Layer2() {    
-    this.samples = new Float64Array(3);
-    this.allocation = makeArray([2, 32], Uint8Array);
-    this.scfsi = makeArray([2, 32], Uint8Array);
-    this.scalefactor = makeArray([2, 32, 3], Uint8Array);
-}
-
-MP3Frame.layers[2] = Layer2;
-
-// possible quantization per subband table
-const SBQUANT = [
-  // ISO/IEC 11172-3 Table B.2a
-  { sblimit: 27, offsets:
-      [ 7, 7, 7, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0 ] },
-      
-  // ISO/IEC 11172-3 Table B.2b
-  { sblimit: 30, offsets:
-      [ 7, 7, 7, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0 ] },
-      
-  // ISO/IEC 11172-3 Table B.2c
-  {  sblimit: 8, offsets:
-      [ 5, 5, 2, 2, 2, 2, 2, 2 ] },
-      
-  // ISO/IEC 11172-3 Table B.2d
-  { sblimit: 12, offsets:
-      [ 5, 5, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 ] },
-      
-  // ISO/IEC 13818-3 Table B.1
-  { sblimit: 30, offsets:
-      [ 4, 4, 4, 4, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 ] }
-];
-
-// bit allocation table
-const BITALLOC = [
-    { nbal: 2, offset: 0 },  // 0
-    { nbal: 2, offset: 3 },  // 1
-    { nbal: 3, offset: 3 },  // 2
-    { nbal: 3, offset: 1 },  // 3
-    { nbal: 4, offset: 2 },  // 4
-    { nbal: 4, offset: 3 },  // 5
-    { nbal: 4, offset: 4 },  // 6
-    { nbal: 4, offset: 5 }   // 7
-];
-
-// offsets into quantization class table
-const OFFSETS = [
-    [ 0, 1, 16                                             ],  // 0
-    [ 0, 1,  2, 3, 4, 5, 16                                ],  // 1
-    [ 0, 1,  2, 3, 4, 5,  6, 7,  8,  9, 10, 11, 12, 13, 14 ],  // 2
-    [ 0, 1,  3, 4, 5, 6,  7, 8,  9, 10, 11, 12, 13, 14, 15 ],  // 3
-    [ 0, 1,  2, 3, 4, 5,  6, 7,  8,  9, 10, 11, 12, 13, 16 ],  // 4
-    [ 0, 2,  4, 5, 6, 7,  8, 9, 10, 11, 12, 13, 14, 15, 16 ]   // 5
-];
-
-
-
-/*
- * These are the Layer II classes of quantization.
- * The table is derived from Table B.4 of ISO/IEC 11172-3.
- */
-const QC_TABLE = [
-    { nlevels:     3, group: 2, bits:  5, C: 1.33333333333, D: 0.50000000000 },
-    { nlevels:     5, group: 3, bits:  7, C: 1.60000000000, D: 0.50000000000 },
-    { nlevels:     7, group: 0, bits:  3, C: 1.14285714286, D: 0.25000000000 },
-    { nlevels:     9, group: 4, bits: 10, C: 1.77777777777, D: 0.50000000000 },
-    { nlevels:    15, group: 0, bits:  4, C: 1.06666666666, D: 0.12500000000 },
-    { nlevels:    31, group: 0, bits:  5, C: 1.03225806452, D: 0.06250000000 },
-    { nlevels:    63, group: 0, bits:  6, C: 1.01587301587, D: 0.03125000000 },
-    { nlevels:   127, group: 0, bits:  7, C: 1.00787401575, D: 0.01562500000 },
-    { nlevels:   255, group: 0, bits:  8, C: 1.00392156863, D: 0.00781250000 },
-    { nlevels:   511, group: 0, bits:  9, C: 1.00195694716, D: 0.00390625000 },
-    { nlevels:  1023, group: 0, bits: 10, C: 1.00097751711, D: 0.00195312500 },
-    { nlevels:  2047, group: 0, bits: 11, C: 1.00048851979, D: 0.00097656250 },
-    { nlevels:  4095, group: 0, bits: 12, C: 1.00024420024, D: 0.00048828125 },
-    { nlevels:  8191, group: 0, bits: 13, C: 1.00012208522, D: 0.00024414063 },
-    { nlevels: 16383, group: 0, bits: 14, C: 1.00006103888, D: 0.00012207031 },
-    { nlevels: 32767, group: 0, bits: 15, C: 1.00003051851, D: 0.00006103516 },
-    { nlevels: 65535, group: 0, bits: 16, C: 1.00001525902, D: 0.00003051758 }
-];
-
-Layer2.prototype.decode = function(stream, frame) {
-    var header = frame.header;
-    var nch = header.nchannels();
-    var index;
-    
-    if (header.flags & FLAGS.LSF_EXT) {
-        index = 4;
-    } else if (header.flags & FLAGS.FREEFORMAT) {
-        index = header.samplerate === 48000 ? 0 : 1;
-    } else {
-        var bitrate_per_channel = header.bitrate;
-        
-        if (nch === 2) {
-            bitrate_per_channel /= 2;
-            
-            /*
-             * ISO/IEC 11172-3 allows only single channel mode for 32, 48, 56, and
-             * 80 kbps bitrates in Layer II, but some encoders ignore this
-             * restriction, so we ignore it as well.
-             */
-        } else {
-            /*
-        	 * ISO/IEC 11172-3 does not allow single channel mode for 224, 256,
-        	 * 320, or 384 kbps bitrates in Layer II.
-        	 */
-            if (bitrate_per_channel > 192000)
-                throw new Error('bad bitrate/mode combination');
-        }
-        
-        if (bitrate_per_channel <= 48000)
-            index = header.samplerate === 32000 ? 3 : 2;
-        else if (bitrate_per_channel <= 80000)
-            index = 0;
-        else
-            index = header.samplerate === 48000 ? 0 : 1;
-    }
-    
-    var sblimit = SBQUANT[index].sblimit;
-    var offsets = SBQUANT[index].offsets;
-    
-    var bound = 32;
-    if (header.mode === MODE.JOINT_STEREO) {
-        header.flags |= FLAGS.I_STEREO;
-        bound = 4 + header.mode_extension * 4;
-    }
-    
-    if (bound > sblimit)
-        bound = sblimit;
-    
-    // decode bit allocations
-    var allocation = this.allocation;
-    for (var sb = 0; sb < bound; sb++) {
-        var nbal = BITALLOC[offsets[sb]].nbal;
-        
-        for (var ch = 0; ch < nch; ch++)
-            allocation[ch][sb] = stream.read(nbal);
-    }
-    
-    for (var sb = bound; sb < sblimit; sb++) {
-        var nbal = BITALLOC[offsets[sb]].nbal;
-        
-        allocation[0][sb] =
-        allocation[1][sb] = stream.read(nbal);
-    }
-    
-    // decode scalefactor selection info
-    var scfsi = this.scfsi;
-    for (var sb = 0; sb < sblimit; sb++) {
-        for (var ch = 0; ch < nch; ch++) {
-            if (allocation[ch][sb])
-                scfsi[ch][sb] = stream.read(2);
-        }
-    }
-    
-    if (header.flags & FLAGS.PROTECTION) {
-        // TODO: crc check
-    }
-    
-    // decode scalefactors
-    var scalefactor = this.scalefactor;
-    for (var sb = 0; sb < sblimit; sb++) {
-        for (var ch = 0; ch < nch; ch++) {
-            if (allocation[ch][sb]) {
-                scalefactor[ch][sb][0] = stream.read(6);
-                
-                switch (scfsi[ch][sb]) {
-            	    case 2:
-            	        scalefactor[ch][sb][2] =
-                        scalefactor[ch][sb][1] = scalefactor[ch][sb][0];
-                        break;
-                        
-                    case 0:
-                        scalefactor[ch][sb][1] = stream.read(6);
-                    	// fall through
-                    	
-                    case 1:
-                    case 3:
-                        scalefactor[ch][sb][2] = stream.read(6);
-                }
-                
-                if (scfsi[ch][sb] & 1)
-                    scalefactor[ch][sb][1] = scalefactor[ch][sb][scfsi[ch][sb] - 1];
-                    
-                /*
-            	 * Scalefactor index 63 does not appear in Table B.1 of
-            	 * ISO/IEC 11172-3. Nonetheless, other implementations accept it,
-            	 * so we do as well.
-            	 */
-            }
-        }
-    }
-    
-    // decode samples
-    for (var gr = 0; gr < 12; gr++) {
-        // normal
-        for (var sb = 0; sb < bound; sb++) {
-            for (var ch = 0; ch < nch; ch++) {                
-                if (index = allocation[ch][sb]) {
-                    index = OFFSETS[BITALLOC[offsets[sb]].offset][index - 1];
-                    this.decodeSamples(stream, QC_TABLE[index]);
-                    
-                    var scale = SF_TABLE[scalefactor[ch][sb][gr >> 2]];
-                    for (var s = 0; s < 3; s++) {
-                        frame.sbsample[ch][3 * gr + s][sb] = this.samples[s] * scale;
-                    }
-                } else {
-                    for (var s = 0; s < 3; s++) {
-                        frame.sbsample[ch][3 * gr + s][sb] = 0;
-                    }
-                }
-            }
-        }
-        
-        // joint stereo
-        for (var sb = bound; sb < sblimit; sb++) {
-            if (index = allocation[0][sb]) {
-                index = OFFSETS[BITALLOC[offsets[sb]].offset][index - 1];
-                this.decodeSamples(stream, QC_TABLE[index]);
-                
-                for (var ch = 0; ch < nch; ch++) {
-                    var scale = SF_TABLE[scalefactor[ch][sb][gr >> 2]];
-                    for (var s = 0; s < 3; s++) {
-                        frame.sbsample[ch][3 * gr + s][sb] = this.samples[s] * scale;
-                    }
-                }
-            } else {
-                for (var ch = 0; ch < nch; ch++) {
-                    for (var s = 0; s < 3; s++) {
-                        frame.sbsample[ch][3 * gr + s][sb] = 0;
-                    }
-                }
-            }
-        }
-        
-        // the rest
-        for (var ch = 0; ch < nch; ch++) {
-            for (var s = 0; s < 3; s++) {
-                for (var sb = sblimit; sb < 32; sb++) {
-                    frame.sbsample[ch][3 * gr + s][sb] = 0;
-                }
-            }
-        }
-    }
-};
-
-Layer2.prototype.decodeSamples = function(stream, quantclass) {
-    var sample = this.samples;
-    var nb = quantclass.group;
-    
-    if (nb) {
-        // degrouping
-        var c = stream.read(quantclass.bits);
-        var nlevels = quantclass.nlevels;
-        
-        for (var s = 0; s < 3; s++) {
-            sample[s] = c % nlevels;
-            c = c / nlevels | 0;
-        }
-    } else {
-        nb = quantclass.bits;
-        for (var s = 0; s < 3; s++) {
-            sample[s] = stream.read(nb);
-        }
-    }
-    
-    for (var s = 0; s < 3; s++) {
-        // invert most significant bit, and form a 2's complement sample
-        var requantized = sample[s] ^ (1 << (nb - 1));
-        requantized |= -(requantized & (1 << (nb - 1)));
-        requantized /= (1 << (nb - 1));
-        
-        // requantize the sample
-        sample[s] = (requantized + quantclass.D) * quantclass.C;
-    }
-};
+}).call(this,typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{}],6:[function(require,module,exports){
 /*
  * These are the Huffman code words for Layer III.
  * The data for these tables are derived from Table B.7 of ISO/IEC 11172-3.
@@ -3129,7 +716,8 @@ var huffquad_V = function (v, w, x, y, hlen) {
             v: v,
             w: w,
             x: x,
-            y: y
+            y: y,
+            hlen: hlen
         }
     };
 };
@@ -6054,9 +3642,8 @@ function MP3Hufftable(table, linbits, startbits) {
 };
 
 /* external tables */
-const huff_quad_table = [ hufftabA, hufftabB ];
-
-const huff_pair_table = [
+exports.huff_quad_table = [ hufftabA, hufftabB ];
+exports.huff_pair_table = [
   /*  0 */ new MP3Hufftable(hufftab0,   0, 0),
   /*  1 */ new MP3Hufftable(hufftab1,   0, 3),
   /*  2 */ new MP3Hufftable(hufftab2,   0, 3),
@@ -6090,153 +3677,830 @@ const huff_pair_table = [
   /* 30 */ new MP3Hufftable(hufftab24, 11, 4),
   /* 31 */ new MP3Hufftable(hufftab24, 13, 4)
 ];
-var IMDCT = (function() {
 
-    function IMDCT() {
-        this.tmp_imdct36 = new Float64Array(18);
-        this.tmp_dctIV = new Float64Array(18);
-        this.tmp_sdctII = new Float64Array(9);
+},{}],7:[function(require,module,exports){
+(function (global){
+var AV = (typeof window !== "undefined" ? window['AV'] : typeof global !== "undefined" ? global['AV'] : null);
+
+const ENCODINGS = ['latin1', 'utf16-bom', 'utf16-be', 'utf8'];
+
+var ID3Stream = AV.Base.extend({
+    constructor: function(header, stream) {
+        this.header = header;
+        this.stream = stream;
+        this.offset = 0;
+    },
+    
+    read: function() {
+        if (!this.data) {
+            this.data = {};
+            
+            // read all frames
+            var frame;
+            while (frame = this.readFrame()) {
+                // if we already have an instance of this key, add it to an array
+                if (frame.key in this.data) {
+                    if (!Array.isArray(this.data[frame.key]))
+                        this.data[frame.key] = [this.data[frame.key]];
+                        
+                    this.data[frame.key].push(frame.value);
+                } else {
+                    this.data[frame.key] = frame.value;
+                }
+            }
+        }
+
+        return this.data;
+    },
+    
+    readFrame: function() {
+        if (this.offset >= this.header.length)
+            return null;
+        
+        // get the header    
+        var header = this.readHeader();
+        var decoder = header.identifier;
+        
+        if (header.identifier.charCodeAt(0) === 0) {
+            this.offset += this.header.length + 1;
+            return null;
+        }
+        
+        // map common frame names to a single type
+        if (!this.frameTypes[decoder]) {
+            for (var key in this.map) {
+                if (this.map[key].indexOf(decoder) !== -1) {
+                    decoder = key;
+                    break;
+                }
+            }
+        }
+
+        if (this.frameTypes[decoder]) {
+            // decode the frame
+            var frame = this.decodeFrame(header, this.frameTypes[decoder]),
+                keys = Object.keys(frame);
+            
+            // if it only returned one key, use that as the value    
+            if (keys.length === 1)
+                frame = frame[keys[0]];
+            
+            var result = {
+                value: frame
+            };
+            
+        } else {
+            // No frame type found, treat it as binary
+            var result = {
+                value: this.stream.readBuffer(Math.min(header.length, this.header.length - this.offset))
+            };
+        }
+
+        result.key = this.names[header.identifier] ? this.names[header.identifier] : header.identifier;
+        
+        // special sauce for cover art, which should just be a buffer
+        if (result.key === 'coverArt')
+            result.value = result.value.data;
+
+        this.offset += 10 + header.length;
+        return result;
+    },
+
+    decodeFrame: function(header, fields) {
+        var stream = this.stream,
+            start = stream.offset;
+            
+        var encoding = 0, ret = {};
+        var len = Object.keys(fields).length, i = 0;
+        
+        for (var key in fields) {
+            var type = fields[key];
+            var rest = header.length - (stream.offset - start);
+            i++;
+            
+            // check for special field names
+            switch (key) {
+                case 'encoding':
+                    encoding = stream.readUInt8();
+                    continue;
+                
+                case 'language':
+                    ret.language = stream.readString(3);
+                    continue;
+            }
+            
+            // check types
+            switch (type) {                    
+                case 'latin1':
+                    ret[key] = stream.readString(i === len ? rest : null, 'latin1');
+                    break;
+                    
+                case 'string':
+                    ret[key] = stream.readString(i === len ? rest : null, ENCODINGS[encoding]);
+                    break;
+                    
+                case 'binary':
+                    ret[key] = stream.readBuffer(rest)
+                    break;
+                    
+                case 'int16':
+                    ret[key] = stream.readInt16();
+                    break;
+                    
+                case 'int8':
+                    ret[key] = stream.readInt8();
+                    break;
+                    
+                case 'int24':
+                    ret[key] = stream.readInt24();
+                    break;
+                    
+                case 'int32':
+                    ret[key] = stream.readInt32();
+                    break;
+                    
+                case 'int32+':
+                    ret[key] = stream.readInt32();
+                    if (rest > 4)
+                        throw new Error('Seriously dude? Stop playing this song and get a life!');
+                        
+                    break;
+                    
+                case 'date':
+                    var val = stream.readString(8);
+                    ret[key] = new Date(val.slice(0, 4), val.slice(4, 6) - 1, val.slice(6, 8));
+                    break;
+                    
+                case 'frame_id':
+                    ret[key] = stream.readString(4);
+                    break;
+                    
+                default:
+                    throw new Error('Unknown key type ' + type);
+            }
+        }
+        
+        // Just in case something went wrong...
+        var rest = header.length - (stream.offset - start);
+        if (rest > 0)
+            stream.advance(rest);
+        
+        return ret;
     }
-    
-    // perform X[18]->x[36] IMDCT using Szu-Wei Lee's fast algorithm
-    IMDCT.prototype.imdct36 = function(x, y) {
-        var tmp = this.tmp_imdct36;
+});
 
-        /* DCT-IV */
-        this.dctIV(x, tmp);
-
-        // convert 18-point DCT-IV to 36-point IMDCT
-        for (var i =  0; i <  9; ++i) {
-            y[i] =  tmp[9 + i];
+// ID3 v2.3 and v2.4 support
+exports.ID3v23Stream = ID3Stream.extend({
+    readHeader: function() {
+        var identifier = this.stream.readString(4);        
+        var length = 0;
+        
+        if (this.header.major === 4) {
+            for (var i = 0; i < 4; i++)
+                length = (length << 7) + (this.stream.readUInt8() & 0x7f);
+        } else {
+            length = this.stream.readUInt32();
         }
-        for (var i =  9; i < 27; ++i) {
-            y[i] = -tmp[36 - (9 + i) - 1];
-        }
-        for (var i = 27; i < 36; ++i) {
-            y[i] = -tmp[i - 27];
-        }
-    };
+        
+        return {
+            identifier: identifier,
+            length: length,
+            flags: this.stream.readUInt16()
+        };
+    },
     
-    var dctIV_scale = [];
-    for(i = 0; i < 18; i++) {
-        dctIV_scale[i] = 2 * Math.cos(Math.PI * (2 * i + 1) / (4 * 18));
+    map: {
+        text: [
+            // Identification Frames
+            'TIT1', 'TIT2', 'TIT3', 'TALB', 'TOAL', 'TRCK', 'TPOS', 'TSST', 'TSRC',
+
+            // Involved Persons Frames
+            'TPE1', 'TPE2', 'TPE3', 'TPE4', 'TOPE', 'TEXT', 'TOLY', 'TCOM', 'TMCL', 'TIPL', 'TENC',
+
+            // Derived and Subjective Properties Frames
+            'TBPM', 'TLEN', 'TKEY', 'TLAN', 'TCON', 'TFLT', 'TMED', 'TMOO',
+
+            // Rights and Licence Frames
+            'TCOP', 'TPRO', 'TPUB', 'TOWN', 'TRSN', 'TRSO',
+
+            // Other Text Frames
+            'TOFN', 'TDLY', 'TDEN', 'TDOR', 'TDRC', 'TDRL', 'TDTG', 'TSSE', 'TSOA', 'TSOP', 'TSOT',
+            
+            // Deprecated Text Frames
+            'TDAT', 'TIME', 'TORY', 'TRDA', 'TSIZ', 'TYER',
+            
+            // Non-standard iTunes Frames
+            'TCMP', 'TSO2', 'TSOC'
+        ],
+        
+        url: [
+            'WCOM', 'WCOP', 'WOAF', 'WOAR', 'WOAS', 'WORS', 'WPAY', 'WPUB'
+        ]
+    },
+    
+    frameTypes: {        
+        text: {
+            encoding: 1,
+            value: 'string'
+        },
+        
+        url: {
+            value: 'latin1'
+        },
+        
+        TXXX: {
+            encoding: 1,
+            description: 'string',
+            value: 'string'
+        },
+        
+        WXXX: {
+            encoding: 1,
+            description: 'string',
+            value: 'latin1',
+        },
+        
+        USLT: {
+            encoding: 1,
+            language: 1,
+            description: 'string',
+            value: 'string'
+        },
+        
+        COMM: {
+            encoding: 1,
+            language: 1,
+            description: 'string',
+            value: 'string'
+        },
+        
+        APIC: {
+            encoding: 1,
+            mime: 'latin1',
+            type: 'int8',
+            description: 'string',
+            data: 'binary'
+        },
+        
+        UFID: {
+            owner: 'latin1',
+            identifier: 'binary'
+        },
+
+        MCDI: {
+            value: 'binary'
+        },
+        
+        PRIV: {
+            owner: 'latin1',
+            value: 'binary'
+        },
+        
+        GEOB: {
+            encoding: 1,
+            mime: 'latin1',
+            filename: 'string',
+            description: 'string',
+            data: 'binary'
+        },
+        
+        PCNT: {
+            value: 'int32+'
+        },
+        
+        POPM: {
+            email: 'latin1',
+            rating: 'int8',
+            counter: 'int32+'
+        },
+        
+        AENC: {
+            owner: 'latin1',
+            previewStart: 'int16',
+            previewLength: 'int16',
+            encryptionInfo: 'binary'
+        },
+        
+        ETCO: {
+            format: 'int8',
+            data: 'binary'  // TODO
+        },
+        
+        MLLT: {
+            framesBetweenReference: 'int16',
+            bytesBetweenReference: 'int24',
+            millisecondsBetweenReference: 'int24',
+            bitsForBytesDeviation: 'int8',
+            bitsForMillisecondsDev: 'int8',
+            data: 'binary' // TODO
+        },
+        
+        SYTC: {
+            format: 'int8',
+            tempoData: 'binary' // TODO
+        },
+        
+        SYLT: {
+            encoding: 1,
+            language: 1,
+            format: 'int8',
+            contentType: 'int8',
+            description: 'string',
+            data: 'binary' // TODO
+        },
+        
+        RVA2: {
+            identification: 'latin1',
+            data: 'binary' // TODO
+        },
+        
+        EQU2: {
+            interpolationMethod: 'int8',
+            identification: 'latin1',
+            data: 'binary' // TODO
+        },
+        
+        RVRB: {
+            left: 'int16',
+            right: 'int16',
+            bouncesLeft: 'int8',
+            bouncesRight: 'int8',
+            feedbackLL: 'int8',
+            feedbackLR: 'int8',
+            feedbackRR: 'int8',
+            feedbackRL: 'int8',
+            premixLR: 'int8',
+            premixRL: 'int8'
+        },
+        
+        RBUF: {
+            size: 'int24',
+            flag: 'int8',
+            offset: 'int32'
+        },
+        
+        LINK: {
+            identifier: 'frame_id',
+            url: 'latin1',
+            data: 'binary' // TODO stringlist?
+        },
+        
+        POSS: {
+            format: 'int8',
+            position: 'binary' // TODO
+        },
+        
+        USER: {
+            encoding: 1,
+            language: 1,
+            value: 'string'
+        },
+        
+        OWNE: {
+            encoding: 1,
+            price: 'latin1',
+            purchaseDate: 'date',
+            seller: 'string'
+        },
+        
+        COMR: {
+            encoding: 1,
+            price: 'latin1',
+            validUntil: 'date',
+            contactURL: 'latin1',
+            receivedAs: 'int8',
+            seller: 'string',
+            description: 'string',
+            logoMime: 'latin1',
+            logo: 'binary'
+        },
+        
+        ENCR: {
+            owner: 'latin1',
+            methodSymbol: 'int8',
+            data: 'binary'
+        },
+        
+        GRID: {
+            owner: 'latin1',
+            groupSymbol: 'int8',
+            data: 'binary'
+        },
+        
+        SIGN: {
+            groupSymbol: 'int8',
+            signature: 'binary'
+        },
+        
+        SEEK: {
+            value: 'int32'
+        },
+        
+        ASPI: {
+            dataStart: 'int32',
+            dataLength: 'int32',
+            numPoints: 'int16',
+            bitsPerPoint: 'int8',
+            data: 'binary' // TODO
+        },
+        
+        // Deprecated ID3 v2.3 frames
+        IPLS: {
+            encoding: 1,
+            value: 'string' // list?
+        },
+        
+        RVAD: {
+            adjustment: 'int8',
+            bits: 'int8',
+            data: 'binary' // TODO
+        },
+        
+        EQUA: {
+            adjustmentBits: 'int8',
+            data: 'binary' // TODO
+        }
+    },
+    
+    names: {
+        // Identification Frames
+        'TIT1': 'grouping',
+        'TIT2': 'title',
+        'TIT3': 'subtitle',
+        'TALB': 'album',
+        'TOAL': 'originalAlbumTitle',
+        'TRCK': 'trackNumber',
+        'TPOS': 'diskNumber',
+        'TSST': 'setSubtitle',
+        'TSRC': 'ISRC',
+
+        // Involved Persons Frames
+        'TPE1': 'artist',
+        'TPE2': 'albumArtist',
+        'TPE3': 'conductor',
+        'TPE4': 'modifiedBy',
+        'TOPE': 'originalArtist',
+        'TEXT': 'lyricist',
+        'TOLY': 'originalLyricist',
+        'TCOM': 'composer',
+        'TMCL': 'musicianCreditsList',
+        'TIPL': 'involvedPeopleList',
+        'TENC': 'encodedBy',
+
+        // Derived and Subjective Properties Frames
+        'TBPM': 'tempo',
+        'TLEN': 'length',
+        'TKEY': 'initialKey',
+        'TLAN': 'language',
+        'TCON': 'genre',
+        'TFLT': 'fileType',
+        'TMED': 'mediaType',
+        'TMOO': 'mood',
+
+        // Rights and Licence Frames
+        'TCOP': 'copyright',
+        'TPRO': 'producedNotice',
+        'TPUB': 'publisher',
+        'TOWN': 'fileOwner',
+        'TRSN': 'internetRadioStationName',
+        'TRSO': 'internetRadioStationOwner',
+
+        // Other Text Frames
+        'TOFN': 'originalFilename',
+        'TDLY': 'playlistDelay',
+        'TDEN': 'encodingTime',
+        'TDOR': 'originalReleaseTime',
+        'TDRC': 'recordingTime',
+        'TDRL': 'releaseTime',
+        'TDTG': 'taggingTime',
+        'TSSE': 'encodedWith',
+        'TSOA': 'albumSortOrder',
+        'TSOP': 'performerSortOrder',
+        'TSOT': 'titleSortOrder',
+        
+        // User defined text information
+        'TXXX': 'userText',
+        
+        // Unsynchronised lyrics/text transcription
+        'USLT': 'lyrics',
+
+        // Attached Picture Frame
+        'APIC': 'coverArt',
+
+        // Unique Identifier Frame
+        'UFID': 'uniqueIdentifier',
+
+        // Music CD Identifier Frame
+        'MCDI': 'CDIdentifier',
+
+        // Comment Frame
+        'COMM': 'comments',
+        
+        // URL link frames
+        'WCOM': 'commercialInformation',
+        'WCOP': 'copyrightInformation',
+        'WOAF': 'officialAudioFileWebpage',
+        'WOAR': 'officialArtistWebpage',
+        'WOAS': 'officialAudioSourceWebpage',
+        'WORS': 'officialInternetRadioStationHomepage',
+        'WPAY': 'payment',
+        'WPUB': 'officialPublisherWebpage',
+
+        // User Defined URL Link Frame
+        'WXXX': 'url',
+
+        'PRIV': 'private',
+        'GEOB': 'generalEncapsulatedObject',
+        'PCNT': 'playCount',
+        'POPM': 'rating',
+        'AENC': 'audioEncryption',
+        'ETCO': 'eventTimingCodes',
+        'MLLT': 'MPEGLocationLookupTable',
+        'SYTC': 'synchronisedTempoCodes',
+        'SYLT': 'synchronisedLyrics',
+        'RVA2': 'volumeAdjustment',
+        'EQU2': 'equalization',
+        'RVRB': 'reverb',
+        'RBUF': 'recommendedBufferSize',
+        'LINK': 'link',
+        'POSS': 'positionSynchronisation',
+        'USER': 'termsOfUse',
+        'OWNE': 'ownership',
+        'COMR': 'commercial',
+        'ENCR': 'encryption',
+        'GRID': 'groupIdentifier',
+        'SIGN': 'signature',
+        'SEEK': 'seek',
+        'ASPI': 'audioSeekPointIndex',
+
+        // Deprecated ID3 v2.3 frames
+        'TDAT': 'date',
+        'TIME': 'time',
+        'TORY': 'originalReleaseYear',
+        'TRDA': 'recordingDates',
+        'TSIZ': 'size',
+        'TYER': 'year',
+        'IPLS': 'involvedPeopleList',
+        'RVAD': 'volumeAdjustment',
+        'EQUA': 'equalization',
+        
+        // Non-standard iTunes frames
+        'TCMP': 'compilation',
+        'TSO2': 'albumArtistSortOrder',
+        'TSOC': 'composerSortOrder'
+    }
+});
+
+// ID3 v2.2 support
+exports.ID3v22Stream = exports.ID3v23Stream.extend({    
+    readHeader: function() {
+        var id = this.stream.readString(3);
+        
+        if (this.frameReplacements[id] && !this.frameTypes[id])
+            this.frameTypes[id] = this.frameReplacements[id];
+        
+        return {
+            identifier: this.replacements[id] || id,
+            length: this.stream.readUInt24()
+        };
+    },
+    
+    // map 3 char ID3 v2.2 names to 4 char ID3 v2.3/4 names
+    replacements: {
+        'UFI': 'UFID',
+        'TT1': 'TIT1',
+        'TT2': 'TIT2',
+        'TT3': 'TIT3',
+        'TP1': 'TPE1',
+        'TP2': 'TPE2',
+        'TP3': 'TPE3',
+        'TP4': 'TPE4',
+        'TCM': 'TCOM',
+        'TXT': 'TEXT',
+        'TLA': 'TLAN',
+        'TCO': 'TCON',
+        'TAL': 'TALB',
+        'TPA': 'TPOS',
+        'TRK': 'TRCK',
+        'TRC': 'TSRC',
+        'TYE': 'TYER',
+        'TDA': 'TDAT',
+        'TIM': 'TIME',
+        'TRD': 'TRDA',
+        'TMT': 'TMED',
+        'TFT': 'TFLT',
+        'TBP': 'TBPM',
+        'TCR': 'TCOP',
+        'TPB': 'TPUB',
+        'TEN': 'TENC',
+        'TSS': 'TSSE',
+        'TOF': 'TOFN',
+        'TLE': 'TLEN',
+        'TSI': 'TSIZ',
+        'TDY': 'TDLY',
+        'TKE': 'TKEY',
+        'TOT': 'TOAL',
+        'TOA': 'TOPE',
+        'TOL': 'TOLY',
+        'TOR': 'TORY',
+        'TXX': 'TXXX',
+        
+        'WAF': 'WOAF',
+        'WAR': 'WOAR',
+        'WAS': 'WOAS',
+        'WCM': 'WCOM',
+        'WCP': 'WCOP',
+        'WPB': 'WPUB',
+        'WXX': 'WXXX',
+        
+        'IPL': 'IPLS',
+        'MCI': 'MCDI',
+        'ETC': 'ETCO',
+        'MLL': 'MLLT',
+        'STC': 'SYTC',
+        'ULT': 'USLT',
+        'SLT': 'SYLT',
+        'COM': 'COMM',
+        'RVA': 'RVAD',
+        'EQU': 'EQUA',
+        'REV': 'RVRB',
+        
+        'GEO': 'GEOB',
+        'CNT': 'PCNT',
+        'POP': 'POPM',
+        'BUF': 'RBUF',
+        'CRA': 'AENC',
+        'LNK': 'LINK',
+        
+        // iTunes stuff
+        'TST': 'TSOT',
+        'TSP': 'TSOP',
+        'TSA': 'TSOA',
+        'TCP': 'TCMP',
+        'TS2': 'TSO2',
+        'TSC': 'TSOC'
+    },
+    
+    // replacements for ID3 v2.3/4 frames
+    frameReplacements: {
+        PIC: {
+            encoding: 1,
+            format: 'int24',
+            type: 'int8',
+            description: 'string',
+            data: 'binary'
+        },
+        
+        CRM: {
+            owner: 'latin1',
+            description: 'latin1',
+            data: 'binary'
+        }
+    }
+});
+}).call(this,typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{}],8:[function(require,module,exports){
+function IMDCT() {
+    this.tmp_imdct36 = new Float64Array(18);
+    this.tmp_dctIV = new Float64Array(18);
+    this.tmp_sdctII = new Float64Array(9);
+}
+
+// perform X[18]->x[36] IMDCT using Szu-Wei Lee's fast algorithm
+IMDCT.prototype.imdct36 = function(x, y) {
+    var tmp = this.tmp_imdct36;
+
+    /* DCT-IV */
+    this.dctIV(x, tmp);
+
+    // convert 18-point DCT-IV to 36-point IMDCT
+    for (var i =  0; i <  9; ++i) {
+        y[i] =  tmp[9 + i];
+    }
+    for (var i =  9; i < 27; ++i) {
+        y[i] = -tmp[36 - (9 + i) - 1];
+    }
+    for (var i = 27; i < 36; ++i) {
+        y[i] = -tmp[i - 27];
+    }
+};
+
+var dctIV_scale = [];
+for(i = 0; i < 18; i++) {
+    dctIV_scale[i] = 2 * Math.cos(Math.PI * (2 * i + 1) / (4 * 18));
+}
+
+IMDCT.prototype.dctIV = function(y, X) {
+    var tmp = this.tmp_dctIV;
+
+    // scaling
+    for (var i = 0; i < 18; ++i) {
+        tmp[i] = y[i] * dctIV_scale[i];
     }
 
-    IMDCT.prototype.dctIV = function(y, X) {
-        var tmp = this.tmp_dctIV;
+    // SDCT-II
+    this.sdctII(tmp, X);
 
-        // scaling
-        for (var i = 0; i < 18; ++i) {
-            tmp[i] = y[i] * dctIV_scale[i];
-        }
+    // scale reduction and output accumulation
+    X[0] /= 2;
+    for (var i = 1; i < 18; ++i) {
+        X[i] = X[i] / 2 - X[i - 1];
+    }
+};
 
-        // SDCT-II
-        this.sdctII(tmp, X);
+var sdctII_scale = [];
+for (var i = 0; i < 9; ++i) {
+    sdctII_scale[i] = 2 * Math.cos(Math.PI * (2 * i + 1) / (2 * 18));
+}
 
-        // scale reduction and output accumulation
-        X[0] /= 2;
-        for (var i = 1; i < 18; ++i) {
-            X[i] = X[i] / 2 - X[i - 1];
-        }
-    };
-    
-    var sdctII_scale = [];
+IMDCT.prototype.sdctII = function(x, X) {
+    // divide the 18-point SDCT-II into two 9-point SDCT-IIs
+    var tmp = this.tmp_sdctII;
+
+    // even input butterfly
     for (var i = 0; i < 9; ++i) {
-        sdctII_scale[i] = 2 * Math.cos(Math.PI * (2 * i + 1) / (2 * 18));
+        tmp[i] = x[i] + x[18 - i - 1];
     }
 
-    IMDCT.prototype.sdctII = function(x, X) {
-        // divide the 18-point SDCT-II into two 9-point SDCT-IIs
-        var tmp = this.tmp_sdctII;
+    fastsdct(tmp, X, 0);
 
-        // even input butterfly
-        for (var i = 0; i < 9; ++i) {
-            tmp[i] = x[i] + x[18 - i - 1];
-        }
-
-        fastsdct(tmp, X, 0);
-
-        // odd input butterfly and scaling
-        for (var i = 0; i < 9; ++i) {
-            tmp[i] = (x[i] - x[18 - i - 1]) * sdctII_scale[i];
-        }
-
-        fastsdct(tmp, X, 1);
-
-        // output accumulation
-        for (var i = 3; i < 18; i += 2) {
-            X[i] -= X[i - 2];
-        }
-    };
-    
-    var c0 = 2 * Math.cos( 1 * Math.PI / 18);
-    var c1 = 2 * Math.cos( 3 * Math.PI / 18);
-    var c2 = 2 * Math.cos( 4 * Math.PI / 18);
-    var c3 = 2 * Math.cos( 5 * Math.PI / 18);
-    var c4 = 2 * Math.cos( 7 * Math.PI / 18);
-    var c5 = 2 * Math.cos( 8 * Math.PI / 18);
-    var c6 = 2 * Math.cos(16 * Math.PI / 18);
-
-    function fastsdct(x, y, offset) {
-        var a0,  a1,  a2,  a3,  a4,  a5,  a6,  a7,  a8,  a9,  a10, a11, a12;
-        var a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24, a25;
-        var m0,  m1,  m2,  m3,  m4,  m5,  m6,  m7;
-
-        a0 = x[3] + x[5];
-        a1 = x[3] - x[5];
-        a2 = x[6] + x[2];
-        a3 = x[6] - x[2];
-        a4 = x[1] + x[7];
-        a5 = x[1] - x[7];
-        a6 = x[8] + x[0];
-        a7 = x[8] - x[0];
-
-        a8  = a0  + a2;
-        a9  = a0  - a2;
-        a10 = a0  - a6;
-        a11 = a2  - a6;
-        a12 = a8  + a6;
-        a13 = a1  - a3;
-        a14 = a13 + a7;
-        a15 = a3  + a7;
-        a16 = a1  - a7;
-        a17 = a1  + a3;
-
-        m0 = a17 * -c3;
-        m1 = a16 * -c0;
-        m2 = a15 * -c4;
-        m3 = a14 * -c1;
-        m4 = a5  * -c1;
-        m5 = a11 * -c6;
-        m6 = a10 * -c5;
-        m7 = a9  * -c2;
-
-        a18 =     x[4] + a4;
-        a19 = 2 * x[4] - a4;
-        a20 = a19 + m5;
-        a21 = a19 - m5;
-        a22 = a19 + m6;
-        a23 = m4  + m2;
-        a24 = m4  - m2;
-        a25 = m4  + m1;
-
-        // output to every other slot for convenience
-        y[offset +  0] = a18 + a12;
-        y[offset +  2] = m0  - a25;
-        y[offset +  4] = m7  - a20;
-        y[offset +  6] = m3;
-        y[offset +  8] = a21 - m6;
-        y[offset + 10] = a24 - m1;
-        y[offset + 12] = a12 - 2 * a18;
-        y[offset + 14] = a23 + m0;
-        y[offset + 16] = a22 + m7;
+    // odd input butterfly and scaling
+    for (var i = 0; i < 9; ++i) {
+        tmp[i] = (x[i] - x[18 - i - 1]) * sdctII_scale[i];
     }
-    
-    return IMDCT;
-    
-})();
 
-const IMDCT_S = [
+    fastsdct(tmp, X, 1);
+
+    // output accumulation
+    for (var i = 3; i < 18; i += 2) {
+        X[i] -= X[i - 2];
+    }
+};
+
+var c0 = 2 * Math.cos( 1 * Math.PI / 18);
+var c1 = 2 * Math.cos( 3 * Math.PI / 18);
+var c2 = 2 * Math.cos( 4 * Math.PI / 18);
+var c3 = 2 * Math.cos( 5 * Math.PI / 18);
+var c4 = 2 * Math.cos( 7 * Math.PI / 18);
+var c5 = 2 * Math.cos( 8 * Math.PI / 18);
+var c6 = 2 * Math.cos(16 * Math.PI / 18);
+
+function fastsdct(x, y, offset) {
+    var a0,  a1,  a2,  a3,  a4,  a5,  a6,  a7,  a8,  a9,  a10, a11, a12;
+    var a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24, a25;
+    var m0,  m1,  m2,  m3,  m4,  m5,  m6,  m7;
+
+    a0 = x[3] + x[5];
+    a1 = x[3] - x[5];
+    a2 = x[6] + x[2];
+    a3 = x[6] - x[2];
+    a4 = x[1] + x[7];
+    a5 = x[1] - x[7];
+    a6 = x[8] + x[0];
+    a7 = x[8] - x[0];
+
+    a8  = a0  + a2;
+    a9  = a0  - a2;
+    a10 = a0  - a6;
+    a11 = a2  - a6;
+    a12 = a8  + a6;
+    a13 = a1  - a3;
+    a14 = a13 + a7;
+    a15 = a3  + a7;
+    a16 = a1  - a7;
+    a17 = a1  + a3;
+
+    m0 = a17 * -c3;
+    m1 = a16 * -c0;
+    m2 = a15 * -c4;
+    m3 = a14 * -c1;
+    m4 = a5  * -c1;
+    m5 = a11 * -c6;
+    m6 = a10 * -c5;
+    m7 = a9  * -c2;
+
+    a18 =     x[4] + a4;
+    a19 = 2 * x[4] - a4;
+    a20 = a19 + m5;
+    a21 = a19 - m5;
+    a22 = a19 + m6;
+    a23 = m4  + m2;
+    a24 = m4  - m2;
+    a25 = m4  + m1;
+
+    // output to every other slot for convenience
+    y[offset +  0] = a18 + a12;
+    y[offset +  2] = m0  - a25;
+    y[offset +  4] = m7  - a20;
+    y[offset +  6] = m3;
+    y[offset +  8] = a21 - m6;
+    y[offset + 10] = a24 - m1;
+    y[offset + 12] = a12 - 2 * a18;
+    y[offset + 14] = a23 + m0;
+    y[offset + 16] = a22 + m7;
+}
+
+IMDCT.S = [
   /*  0 */  [ 0.608761429,
               -0.923879533,
               -0.130526192,
@@ -6279,6 +4543,418 @@ const IMDCT_S = [
               -0.382683432,
               -0.130526192 ]
 ];
+
+module.exports = IMDCT;
+
+},{}],9:[function(require,module,exports){
+var tables = require('./tables');
+var MP3FrameHeader = require('./header');
+var MP3Frame = require('./frame');
+var utils = require('./utils');
+
+function Layer1() {    
+    this.allocation = utils.makeArray([2, 32], Uint8Array);
+    this.scalefactor = utils.makeArray([2, 32], Uint8Array);
+}
+
+MP3Frame.layers[1] = Layer1;
+
+// linear scaling table
+const LINEAR_TABLE = new Float32Array([
+    1.33333333333333, 1.14285714285714, 1.06666666666667,
+    1.03225806451613, 1.01587301587302, 1.00787401574803,
+    1.00392156862745, 1.00195694716243, 1.00097751710655,
+    1.00048851978505, 1.00024420024420, 1.00012208521548,
+    1.00006103888177, 1.00003051850948
+]);
+
+Layer1.prototype.decode = function(stream, frame) {
+    var header = frame.header;
+    var nch = header.nchannels();
+    
+    var bound = 32;
+    if (header.mode === MP3FrameHeader.MODE.JOINT_STEREO) {
+        header.flags |= MP3FrameHeader.FLAGS.I_STEREO;
+        bound = 4 + header.mode_extension * 4;
+    }
+    
+    if (header.flags & MP3FrameHeader.FLAGS.PROTECTION) {
+        // TODO: crc check
+    }
+    
+    // decode bit allocations
+    var allocation = this.allocation;
+    for (var sb = 0; sb < bound; sb++) {
+        for (var ch = 0; ch < nch; ch++) {
+            var nb = stream.read(4);
+            if (nb === 15)
+                throw new Error("forbidden bit allocation value");
+                
+            allocation[ch][sb] = nb ? nb + 1 : 0;
+        }
+    }
+    
+    for (var sb = bound; sb < 32; sb++) {
+        var nb = stream.read(4);
+        if (nb === 15)
+            throw new Error("forbidden bit allocation value");
+            
+        allocation[0][sb] =
+        allocation[1][sb] = nb ? nb + 1 : 0;
+    }
+    
+    // decode scalefactors
+    var scalefactor = this.scalefactor;
+    for (var sb = 0; sb < 32; sb++) {
+        for (var ch = 0; ch < nch; ch++) {
+            if (allocation[ch][sb]) {
+                scalefactor[ch][sb] = stream.read(6);
+                
+            	/*
+            	 * Scalefactor index 63 does not appear in Table B.1 of
+            	 * ISO/IEC 11172-3. Nonetheless, other implementations accept it,
+                 * so we do as well 
+                 */
+            }
+        }
+    }
+    
+    // decode samples
+    for (var s = 0; s < 12; s++) {
+        for (var sb = 0; sb < bound; sb++) {
+            for (var ch = 0; ch < nch; ch++) {
+                var nb = allocation[ch][sb];
+                frame.sbsample[ch][s][sb] = nb ? this.sample(stream, nb) * tables.SF_TABLE[scalefactor[ch][sb]] : 0;
+            }
+        }
+        
+        for (var sb = bound; sb < 32; sb++) {
+            var nb = allocation[0][sb];
+            if (nb) {
+                var sample = this.sample(stream, nb);
+                
+                for (var ch = 0; ch < nch; ch++) {
+                    frame.sbsample[ch][s][sb] = sample * tables.SF_TABLE[scalefactor[ch][sb]];
+                }
+            } else {
+                for (var ch = 0; ch < nch; ch++) {
+                    frame.sbsample[ch][s][sb] = 0;
+                }
+            }
+        }
+    }
+};
+
+Layer1.prototype.sample = function(stream, nb) {
+    var sample = stream.read(nb);
+    
+    // invert most significant bit, and form a 2's complement sample
+    sample ^= 1 << (nb - 1);
+    sample |= -(sample & (1 << (nb - 1)));
+    sample /= (1 << (nb - 1));
+        
+    // requantize the sample
+    // s'' = (2^nb / (2^nb - 1)) * (s''' + 2^(-nb + 1))
+    sample += 1 >> (nb - 1);
+    return sample * LINEAR_TABLE[nb - 2];
+};
+
+module.exports = Layer1;
+
+},{"./frame":4,"./header":5,"./tables":14,"./utils":15}],10:[function(require,module,exports){
+var tables = require('./tables');
+var MP3FrameHeader = require('./header');
+var MP3Frame = require('./frame');
+var utils = require('./utils');
+
+function Layer2() {    
+    this.samples = new Float64Array(3);
+    this.allocation = utils.makeArray([2, 32], Uint8Array);
+    this.scfsi = utils.makeArray([2, 32], Uint8Array);
+    this.scalefactor = utils.makeArray([2, 32, 3], Uint8Array);
+}
+
+MP3Frame.layers[2] = Layer2;
+
+// possible quantization per subband table
+const SBQUANT = [
+  // ISO/IEC 11172-3 Table B.2a
+  { sblimit: 27, offsets:
+      [ 7, 7, 7, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0 ] },
+      
+  // ISO/IEC 11172-3 Table B.2b
+  { sblimit: 30, offsets:
+      [ 7, 7, 7, 6, 6, 6, 6, 6, 6, 6, 6, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0 ] },
+      
+  // ISO/IEC 11172-3 Table B.2c
+  {  sblimit: 8, offsets:
+      [ 5, 5, 2, 2, 2, 2, 2, 2 ] },
+      
+  // ISO/IEC 11172-3 Table B.2d
+  { sblimit: 12, offsets:
+      [ 5, 5, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 ] },
+      
+  // ISO/IEC 13818-3 Table B.1
+  { sblimit: 30, offsets:
+      [ 4, 4, 4, 4, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 ] }
+];
+
+// bit allocation table
+const BITALLOC = [
+    { nbal: 2, offset: 0 },  // 0
+    { nbal: 2, offset: 3 },  // 1
+    { nbal: 3, offset: 3 },  // 2
+    { nbal: 3, offset: 1 },  // 3
+    { nbal: 4, offset: 2 },  // 4
+    { nbal: 4, offset: 3 },  // 5
+    { nbal: 4, offset: 4 },  // 6
+    { nbal: 4, offset: 5 }   // 7
+];
+
+// offsets into quantization class table
+const OFFSETS = [
+    [ 0, 1, 16                                             ],  // 0
+    [ 0, 1,  2, 3, 4, 5, 16                                ],  // 1
+    [ 0, 1,  2, 3, 4, 5,  6, 7,  8,  9, 10, 11, 12, 13, 14 ],  // 2
+    [ 0, 1,  3, 4, 5, 6,  7, 8,  9, 10, 11, 12, 13, 14, 15 ],  // 3
+    [ 0, 1,  2, 3, 4, 5,  6, 7,  8,  9, 10, 11, 12, 13, 16 ],  // 4
+    [ 0, 2,  4, 5, 6, 7,  8, 9, 10, 11, 12, 13, 14, 15, 16 ]   // 5
+];
+
+
+
+/*
+ * These are the Layer II classes of quantization.
+ * The table is derived from Table B.4 of ISO/IEC 11172-3.
+ */
+const QC_TABLE = [
+    { nlevels:     3, group: 2, bits:  5, C: 1.33333333333, D: 0.50000000000 },
+    { nlevels:     5, group: 3, bits:  7, C: 1.60000000000, D: 0.50000000000 },
+    { nlevels:     7, group: 0, bits:  3, C: 1.14285714286, D: 0.25000000000 },
+    { nlevels:     9, group: 4, bits: 10, C: 1.77777777777, D: 0.50000000000 },
+    { nlevels:    15, group: 0, bits:  4, C: 1.06666666666, D: 0.12500000000 },
+    { nlevels:    31, group: 0, bits:  5, C: 1.03225806452, D: 0.06250000000 },
+    { nlevels:    63, group: 0, bits:  6, C: 1.01587301587, D: 0.03125000000 },
+    { nlevels:   127, group: 0, bits:  7, C: 1.00787401575, D: 0.01562500000 },
+    { nlevels:   255, group: 0, bits:  8, C: 1.00392156863, D: 0.00781250000 },
+    { nlevels:   511, group: 0, bits:  9, C: 1.00195694716, D: 0.00390625000 },
+    { nlevels:  1023, group: 0, bits: 10, C: 1.00097751711, D: 0.00195312500 },
+    { nlevels:  2047, group: 0, bits: 11, C: 1.00048851979, D: 0.00097656250 },
+    { nlevels:  4095, group: 0, bits: 12, C: 1.00024420024, D: 0.00048828125 },
+    { nlevels:  8191, group: 0, bits: 13, C: 1.00012208522, D: 0.00024414063 },
+    { nlevels: 16383, group: 0, bits: 14, C: 1.00006103888, D: 0.00012207031 },
+    { nlevels: 32767, group: 0, bits: 15, C: 1.00003051851, D: 0.00006103516 },
+    { nlevels: 65535, group: 0, bits: 16, C: 1.00001525902, D: 0.00003051758 }
+];
+
+Layer2.prototype.decode = function(stream, frame) {
+    var header = frame.header;
+    var nch = header.nchannels();
+    var index;
+    
+    if (header.flags & MP3FrameHeader.FLAGS.LSF_EXT) {
+        index = 4;
+    } else if (header.flags & MP3FrameHeader.FLAGS.FREEFORMAT) {
+        index = header.samplerate === 48000 ? 0 : 1;
+    } else {
+        var bitrate_per_channel = header.bitrate;
+        
+        if (nch === 2) {
+            bitrate_per_channel /= 2;
+            
+            /*
+             * ISO/IEC 11172-3 allows only single channel mode for 32, 48, 56, and
+             * 80 kbps bitrates in Layer II, but some encoders ignore this
+             * restriction, so we ignore it as well.
+             */
+        } else {
+            /*
+        	 * ISO/IEC 11172-3 does not allow single channel mode for 224, 256,
+        	 * 320, or 384 kbps bitrates in Layer II.
+        	 */
+            if (bitrate_per_channel > 192000)
+                throw new Error('bad bitrate/mode combination');
+        }
+        
+        if (bitrate_per_channel <= 48000)
+            index = header.samplerate === 32000 ? 3 : 2;
+        else if (bitrate_per_channel <= 80000)
+            index = 0;
+        else
+            index = header.samplerate === 48000 ? 0 : 1;
+    }
+    
+    var sblimit = SBQUANT[index].sblimit;
+    var offsets = SBQUANT[index].offsets;
+    
+    var bound = 32;
+    if (header.mode === MP3FrameHeader.MODE.JOINT_STEREO) {
+        header.flags |= MP3FrameHeader.FLAGS.I_STEREO;
+        bound = 4 + header.mode_extension * 4;
+    }
+    
+    if (bound > sblimit)
+        bound = sblimit;
+    
+    // decode bit allocations
+    var allocation = this.allocation;
+    for (var sb = 0; sb < bound; sb++) {
+        var nbal = BITALLOC[offsets[sb]].nbal;
+        
+        for (var ch = 0; ch < nch; ch++)
+            allocation[ch][sb] = stream.read(nbal);
+    }
+    
+    for (var sb = bound; sb < sblimit; sb++) {
+        var nbal = BITALLOC[offsets[sb]].nbal;
+        
+        allocation[0][sb] =
+        allocation[1][sb] = stream.read(nbal);
+    }
+    
+    // decode scalefactor selection info
+    var scfsi = this.scfsi;
+    for (var sb = 0; sb < sblimit; sb++) {
+        for (var ch = 0; ch < nch; ch++) {
+            if (allocation[ch][sb])
+                scfsi[ch][sb] = stream.read(2);
+        }
+    }
+    
+    if (header.flags & MP3FrameHeader.FLAGS.PROTECTION) {
+        // TODO: crc check
+    }
+    
+    // decode scalefactors
+    var scalefactor = this.scalefactor;
+    for (var sb = 0; sb < sblimit; sb++) {
+        for (var ch = 0; ch < nch; ch++) {
+            if (allocation[ch][sb]) {
+                scalefactor[ch][sb][0] = stream.read(6);
+                
+                switch (scfsi[ch][sb]) {
+            	    case 2:
+            	        scalefactor[ch][sb][2] =
+                        scalefactor[ch][sb][1] = scalefactor[ch][sb][0];
+                        break;
+                        
+                    case 0:
+                        scalefactor[ch][sb][1] = stream.read(6);
+                    	// fall through
+                    	
+                    case 1:
+                    case 3:
+                        scalefactor[ch][sb][2] = stream.read(6);
+                }
+                
+                if (scfsi[ch][sb] & 1)
+                    scalefactor[ch][sb][1] = scalefactor[ch][sb][scfsi[ch][sb] - 1];
+                    
+                /*
+            	 * Scalefactor index 63 does not appear in Table B.1 of
+            	 * ISO/IEC 11172-3. Nonetheless, other implementations accept it,
+            	 * so we do as well.
+            	 */
+            }
+        }
+    }
+    
+    // decode samples
+    for (var gr = 0; gr < 12; gr++) {
+        // normal
+        for (var sb = 0; sb < bound; sb++) {
+            for (var ch = 0; ch < nch; ch++) {                
+                if (index = allocation[ch][sb]) {
+                    index = OFFSETS[BITALLOC[offsets[sb]].offset][index - 1];
+                    this.decodeSamples(stream, QC_TABLE[index]);
+                    
+                    var scale = tables.SF_TABLE[scalefactor[ch][sb][gr >> 2]];
+                    for (var s = 0; s < 3; s++) {
+                        frame.sbsample[ch][3 * gr + s][sb] = this.samples[s] * scale;
+                    }
+                } else {
+                    for (var s = 0; s < 3; s++) {
+                        frame.sbsample[ch][3 * gr + s][sb] = 0;
+                    }
+                }
+            }
+        }
+        
+        // joint stereo
+        for (var sb = bound; sb < sblimit; sb++) {
+            if (index = allocation[0][sb]) {
+                index = OFFSETS[BITALLOC[offsets[sb]].offset][index - 1];
+                this.decodeSamples(stream, QC_TABLE[index]);
+                
+                for (var ch = 0; ch < nch; ch++) {
+                    var scale = tables.SF_TABLE[scalefactor[ch][sb][gr >> 2]];
+                    for (var s = 0; s < 3; s++) {
+                        frame.sbsample[ch][3 * gr + s][sb] = this.samples[s] * scale;
+                    }
+                }
+            } else {
+                for (var ch = 0; ch < nch; ch++) {
+                    for (var s = 0; s < 3; s++) {
+                        frame.sbsample[ch][3 * gr + s][sb] = 0;
+                    }
+                }
+            }
+        }
+        
+        // the rest
+        for (var ch = 0; ch < nch; ch++) {
+            for (var s = 0; s < 3; s++) {
+                for (var sb = sblimit; sb < 32; sb++) {
+                    frame.sbsample[ch][3 * gr + s][sb] = 0;
+                }
+            }
+        }
+    }
+};
+
+Layer2.prototype.decodeSamples = function(stream, quantclass) {
+    var sample = this.samples;
+    var nb = quantclass.group;
+    
+    if (nb) {
+        // degrouping
+        var c = stream.read(quantclass.bits);
+        var nlevels = quantclass.nlevels;
+        
+        for (var s = 0; s < 3; s++) {
+            sample[s] = c % nlevels;
+            c = c / nlevels | 0;
+        }
+    } else {
+        nb = quantclass.bits;
+        for (var s = 0; s < 3; s++) {
+            sample[s] = stream.read(nb);
+        }
+    }
+    
+    for (var s = 0; s < 3; s++) {
+        // invert most significant bit, and form a 2's complement sample
+        var requantized = sample[s] ^ (1 << (nb - 1));
+        requantized |= -(requantized & (1 << (nb - 1)));
+        requantized /= (1 << (nb - 1));
+        
+        // requantize the sample
+        sample[s] = (requantized + quantclass.D) * quantclass.C;
+    }
+};
+
+module.exports = Layer2;
+
+},{"./frame":4,"./header":5,"./tables":14,"./utils":15}],11:[function(require,module,exports){
+(function (global){
+var AV = (typeof window !== "undefined" ? window['AV'] : typeof global !== "undefined" ? global['AV'] : null);
+var tables = require('./tables');
+var MP3FrameHeader = require('./header');
+var MP3Frame = require('./frame');
+var huffman = require('./huffman');
+var IMDCT = require('./imdct');
+var utils = require('./utils');
+
 function MP3SideInfo() {
     this.main_data_begin = null;
     this.private_bits = null;
@@ -6319,7 +4995,7 @@ function Layer3() {
     this.modes = new Int16Array(39);
     this.output = new Float64Array(36);
     
-    this.tmp = makeArray([32, 3, 6]);
+    this.tmp = utils.makeArray([32, 3, 6]);
     this.tmp2 = new Float64Array(32 * 3 * 6);
 }
 
@@ -6331,7 +5007,7 @@ Layer3.prototype.decode = function(stream, frame) {
     var md_len = 0;
     
     var nch = header.nchannels();
-    var si_len = (header.flags & FLAGS.LSF_EXT) ? (nch === 1 ? 9 : 17) : (nch === 1 ? 17 : 32);
+    var si_len = (header.flags & MP3FrameHeader.FLAGS.LSF_EXT) ? (nch === 1 ? 9 : 17) : (nch === 1 ? 17 : 32);
         
     // check frame sanity
     if (stream.next_frame - stream.nextByte() < si_len) {
@@ -6340,12 +5016,12 @@ Layer3.prototype.decode = function(stream, frame) {
     }
     
     // check CRC word
-    if (header.flags & FLAGS.PROTECTION) {
+    if (header.flags & MP3FrameHeader.FLAGS.PROTECTION) {
         // TODO: crc check
     }
     
     // decode frame side information
-    var sideInfo = this.sideInfo(stream, nch, header.flags & FLAGS.LSF_EXT);        
+    var sideInfo = this.sideInfo(stream, nch, header.flags & MP3FrameHeader.FLAGS.LSF_EXT);        
     var si = sideInfo.si;
     var data_bitlen = sideInfo.data_bitlen;
     var priv_bitlen = sideInfo.priv_bitlen;
@@ -6387,8 +5063,8 @@ Layer3.prototype.decode = function(stream, frame) {
             var old_md_len = stream.md_len;
             
             if (md_len > si.main_data_begin) {
-                if (stream.md_len + md_len - si.main_data_begin > BUFFER_MDLEN) {
-                    throw new Error("Assertion failed: (stream.md_len + md_len - si.main_data_begin <= MAD_BUFFER_MDLEN)");
+                if (stream.md_len + md_len - si.main_data_begin > MP3FrameHeader.BUFFER_MDLEN) {
+                    throw new Error("Assertion failed: (stream.md_len + md_len - si.main_data_begin <= MAD_MP3FrameHeader.BUFFER_MDLEN)");
                 }
                 
                 frame_used = md_len - si.main_data_begin;
@@ -6488,7 +5164,7 @@ Layer3.prototype.sideInfo = function(stream, nch, lsf) {
                 channel.region1_count = 36;
 
                 if (stream.read(1))
-                    channel.flags |= MIXED_BLOCK_FLAG;
+                    channel.flags |= tables.MIXED_BLOCK_FLAG;
                 else if (channel.block_type === 2)
                     channel.region0_count = 8;
 
@@ -6523,18 +5199,18 @@ Layer3.prototype.decodeMainData = function(stream, frame, si, nch) {
     var header = frame.header;
     var sfreq = header.samplerate;
 
-    if (header.flags & FLAGS.MPEG_2_5_EXT)
+    if (header.flags & MP3FrameHeader.FLAGS.MPEG_2_5_EXT)
         sfreq *= 2;
 
     // 48000 => 0, 44100 => 1, 32000 => 2,
     // 24000 => 3, 22050 => 4, 16000 => 5
     var sfreqi = ((sfreq >>  7) & 0x000f) + ((sfreq >> 15) & 0x0001) - 8;
 
-    if (header.flags & FLAGS.MPEG_2_5_EXT)
+    if (header.flags & MP3FrameHeader.FLAGS.MPEG_2_5_EXT)
         sfreqi += 3;
         
     // scalefactors, Huffman decoding, requantization
-    var ngr = (header.flags & FLAGS.LSF_EXT) ? 1 : 2;
+    var ngr = (header.flags & MP3FrameHeader.FLAGS.LSF_EXT) ? 1 : 2;
     var xr = this.xr;
     
     for (var gr = 0; gr < ngr; ++gr) {
@@ -6546,12 +5222,12 @@ Layer3.prototype.decodeMainData = function(stream, frame, si, nch) {
             var channel = granule.ch[ch];
             var part2_length;
             
-            sfbwidth[ch] = SFBWIDTH_TABLE[sfreqi].l;
+            sfbwidth[ch] = tables.SFBWIDTH_TABLE[sfreqi].l;
             if (channel.block_type === 2) {
-                sfbwidth[ch] = (channel.flags & MIXED_BLOCK_FLAG) ? SFBWIDTH_TABLE[sfreqi].m : SFBWIDTH_TABLE[sfreqi].s;
+                sfbwidth[ch] = (channel.flags & tables.MIXED_BLOCK_FLAG) ? tables.SFBWIDTH_TABLE[sfreqi].m : tables.SFBWIDTH_TABLE[sfreqi].s;
             }
 
-            if (header.flags & FLAGS.LSF_EXT) {
+            if (header.flags & MP3FrameHeader.FLAGS.LSF_EXT) {
                 part2_length = this.scalefactors_lsf(stream, channel, ch === 0 ? 0 : si.gr[1].ch[1], header.mode_extension);
             } else {
                 part2_length = this.scalefactors(stream, channel, si.gr[0].ch[ch], gr === 0 ? 0 : si.scfsi[ch]);
@@ -6561,7 +5237,7 @@ Layer3.prototype.decodeMainData = function(stream, frame, si, nch) {
         }
         
         // joint stereo processing
-        if (header.mode === MODE.JOINT_STEREO && header.mode_extension !== 0)
+        if (header.mode === MP3FrameHeader.MODE.JOINT_STEREO && header.mode_extension !== 0)
             this.stereo(xr, si.gr, gr, header, sfbwidth[0]);
         
         // reordering, alias reduction, IMDCT, overlap-add, frequency inversion
@@ -6582,16 +5258,16 @@ Layer3.prototype.decodeMainData = function(stream, frame, si, nch) {
                  * lower two subbands of mixed blocks. Most other implementations do
                  * this, so by default we will too.
                  */
-                if (channel.flags & MIXED_BLOCK_FLAG)
+                if (channel.flags & tables.MIXED_BLOCK_FLAG)
                     this.aliasreduce(xr[ch], 36);
             } else {
                 this.aliasreduce(xr[ch], 576);
             }
             
             // subbands 0-1
-            if (channel.block_type !== 2 || (channel.flags & MIXED_BLOCK_FLAG)) {
+            if (channel.block_type !== 2 || (channel.flags & tables.MIXED_BLOCK_FLAG)) {
                 var block_type = channel.block_type;
-                if (channel.flags & MIXED_BLOCK_FLAG)
+                if (channel.flags & tables.MIXED_BLOCK_FLAG)
                     block_type = 0;
 
                 // long blocks
@@ -6650,14 +5326,14 @@ Layer3.prototype.decodeMainData = function(stream, frame, si, nch) {
 
 Layer3.prototype.scalefactors = function(stream, channel, gr0ch, scfsi) {
     var start = stream.offset();
-    var slen1 = SFLEN_TABLE[channel.scalefac_compress].slen1;
-    var slen2 = SFLEN_TABLE[channel.scalefac_compress].slen2;
+    var slen1 = tables.SFLEN_TABLE[channel.scalefac_compress].slen1;
+    var slen2 = tables.SFLEN_TABLE[channel.scalefac_compress].slen2;
     var sfbi;
     
     if (channel.block_type === 2) {
         sfbi = 0;
 
-        var nsfb = (channel.flags & MIXED_BLOCK_FLAG) ? 8 + 3 * 3 : 6 * 3;
+        var nsfb = (channel.flags & tables.MIXED_BLOCK_FLAG) ? 8 + 3 * 3 : 6 * 3;
         while (nsfb--)
             channel.scalefac[sfbi++] = stream.read(slen1);
 
@@ -6710,18 +5386,18 @@ Layer3.prototype.scalefactors = function(stream, channel, gr0ch, scfsi) {
 Layer3.prototype.scalefactors_lsf = function(stream, channel, gr1ch, mode_extension) {
     var start = stream.offset();
     var scalefac_compress = channel.scalefac_compress;
-    var index = channel.block_type === 2 ? (channel.flags & MIXED_BLOCK_FLAG ? 2 : 1) : 0;
+    var index = channel.block_type === 2 ? (channel.flags & tables.MIXED_BLOCK_FLAG ? 2 : 1) : 0;
     var slen = new Int32Array(4);
     var nsfb;
     
-    if (!((mode_extension & I_STEREO) && gr1ch)) {
+    if (!((mode_extension & tables.I_STEREO) && gr1ch)) {
         if (scalefac_compress < 400) {
             slen[0] = (scalefac_compress >>> 4) / 5;
             slen[1] = (scalefac_compress >>> 4) % 5;
             slen[2] = (scalefac_compress % 16) >>> 2;
             slen[3] =  scalefac_compress %  4;
         
-            nsfb = NSFB_TABLE[0][index];
+            nsfb = tables.NSFB_TABLE[0][index];
         } else if (scalefac_compress < 500) {
             scalefac_compress -= 400;
 
@@ -6730,7 +5406,7 @@ Layer3.prototype.scalefactors_lsf = function(stream, channel, gr1ch, mode_extens
             slen[2] =  scalefac_compress % 4;
             slen[3] = 0;
 
-            nsfb = NSFB_TABLE[1][index];
+            nsfb = tables.NSFB_TABLE[1][index];
         } else {
             scalefac_compress -= 500;
 
@@ -6739,8 +5415,8 @@ Layer3.prototype.scalefactors_lsf = function(stream, channel, gr1ch, mode_extens
             slen[2] = 0;
             slen[3] = 0;
 
-            channel.flags |= PREFLAG;
-            nsfb = NSFB_TABLE[2][index];
+            channel.flags |= tables.PREFLAG;
+            nsfb = tables.NSFB_TABLE[2][index];
         }
         
         var n = 0;
@@ -6753,7 +5429,7 @@ Layer3.prototype.scalefactors_lsf = function(stream, channel, gr1ch, mode_extens
         while (n < 39) {
             channel.scalefac[n++] = 0;
         }
-    } else {  // (mode_extension & I_STEREO) && gr1ch (i.e. ch == 1)
+    } else {  // (mode_extension & tables.I_STEREO) && gr1ch (i.e. ch == 1)
         scalefac_compress >>>= 1;
         
         if (scalefac_compress < 180) {
@@ -6762,7 +5438,7 @@ Layer3.prototype.scalefactors_lsf = function(stream, channel, gr1ch, mode_extens
             slen[2] = (scalefac_compress % 36) % 6;
             slen[3] = 0;
 
-            nsfb = NSFB_TABLE[3][index];
+            nsfb = tables.NSFB_TABLE[3][index];
         } else if (scalefac_compress < 244) {
             scalefac_compress -= 180;
 
@@ -6771,7 +5447,7 @@ Layer3.prototype.scalefactors_lsf = function(stream, channel, gr1ch, mode_extens
             slen[2] =  scalefac_compress %  4;
             slen[3] = 0;
 
-            nsfb = NSFB_TABLE[4][index];
+            nsfb = tables.NSFB_TABLE[4][index];
         } else {
             scalefac_compress -= 244;
 
@@ -6780,7 +5456,7 @@ Layer3.prototype.scalefactors_lsf = function(stream, channel, gr1ch, mode_extens
             slen[2] = 0;
             slen[3] = 0;
 
-            nsfb = NSFB_TABLE[5][index];
+            nsfb = tables.NSFB_TABLE[5][index];
         }
         
         var n = 0;
@@ -6832,7 +5508,7 @@ Layer3.prototype.huffmanDecode = function(stream, xr, channel, sfbwidth, part2_l
     var sfbound = xrptr + sfbwidth[sfbwidthptr++];
     var rcount  = channel.region0_count + 1;
     
-    var entry = huff_pair_table[channel.table_select[region]];
+    var entry = huffman.huff_pair_table[channel.table_select[region]];
     var table     = entry.table;
     var linbits   = entry.linbits;
     var startbits = entry.startbits;
@@ -6856,7 +5532,7 @@ Layer3.prototype.huffmanDecode = function(stream, xr, channel, sfbwidth, part2_l
                  else
                      rcount = 0; // all remaining
 
-                 entry     = huff_pair_table[channel.table_select[++region]];
+                 entry     = huffman.huff_pair_table[channel.table_select[++region]];
                  table     = entry.table;
                  linbits   = entry.linbits;
                  startbits = entry.startbits;
@@ -7006,7 +5682,7 @@ Layer3.prototype.huffmanDecode = function(stream, xr, channel, sfbwidth, part2_l
         throw new Error('Huffman data overrun');
     
     // count1    
-    var table = huff_quad_table[channel.flags & COUNT1TABLE_SELECT];
+    var table = huffman.huff_quad_table[channel.flags & tables.COUNT1TABLE_SELECT];
     var requantized = this.requantize(1, exp);
     
     while (cachesz + bits_left > 0 && xrptr <= 572) {
@@ -7070,8 +5746,8 @@ Layer3.prototype.huffmanDecode = function(stream, xr, channel, sfbwidth, part2_l
         }
     }
     
-    if (-bits_left > BUFFER_GUARD * 8) {
-        throw new Error("assertion failed: (-bits_left <= BUFFER_GUARD * CHAR_BIT)");
+    if (-bits_left > MP3FrameHeader.BUFFER_GUARD * 8) {
+        throw new Error("assertion failed: (-bits_left <= MP3FrameHeader.BUFFER_GUARD * CHAR_BIT)");
     }
     
     // rzero
@@ -7103,17 +5779,17 @@ Layer3.prototype.requantize = function(value, exp) {
 
 Layer3.prototype.exponents = function(channel, sfbwidth, exponents) {
     var gain = channel.global_gain - 210;
-    var scalefac_multiplier = (channel.flags & SCALEFAC_SCALE) ? 2 : 1;
+    var scalefac_multiplier = (channel.flags & tables.SCALEFAC_SCALE) ? 2 : 1;
     
     if (channel.block_type === 2) {
         var sfbi = 0, l = 0;
         
-        if (channel.flags & MIXED_BLOCK_FLAG) {
-            var premask = (channel.flags & PREFLAG) ? ~0 : 0;
+        if (channel.flags & tables.MIXED_BLOCK_FLAG) {
+            var premask = (channel.flags & tables.PREFLAG) ? ~0 : 0;
             
             // long block subbands 0-1
             while (l < 36) {
-                exponents[sfbi] = gain - ((channel.scalefac[sfbi] + (PRETAB[sfbi] & premask)) << scalefac_multiplier);
+                exponents[sfbi] = gain - ((channel.scalefac[sfbi] + (tables.PRETAB[sfbi] & premask)) << scalefac_multiplier);
                 l += sfbwidth[sfbi++];
             }
         }
@@ -7132,9 +5808,9 @@ Layer3.prototype.exponents = function(channel, sfbwidth, exponents) {
             sfbi += 3;
         }
     } else {
-        if (channel.flags & PREFLAG) {
+        if (channel.flags & tables.PREFLAG) {
             for (var sfbi = 0; sfbi < 22; sfbi++) {
-                exponents[sfbi] = gain - ((channel.scalefac[sfbi] + PRETAB[sfbi]) << scalefac_multiplier);
+                exponents[sfbi] = gain - ((channel.scalefac[sfbi] + tables.PRETAB[sfbi]) << scalefac_multiplier);
             }
         } else {
             for (var sfbi = 0; sfbi < 22; sfbi++) {
@@ -7149,18 +5825,18 @@ Layer3.prototype.stereo = function(xr, granules, gr, header, sfbwidth) {
     var modes = this.modes;
     var sfbi, l, n, i;
     
-    if (granule.ch[0].block_type !== granule.ch[1].block_type || (granule.ch[0].flags & MIXED_BLOCK_FLAG) !== (granule.ch[1].flags & MIXED_BLOCK_FLAG))
+    if (granule.ch[0].block_type !== granule.ch[1].block_type || (granule.ch[0].flags & tables.MIXED_BLOCK_FLAG) !== (granule.ch[1].flags & tables.MIXED_BLOCK_FLAG))
         throw new Error('incompatible stereo block_type');
         
     for (var i = 0; i < 39; i++)
         modes[i] = header.mode_extension;
         
     // intensity stereo
-    if (header.mode_extension & I_STEREO) {
+    if (header.mode_extension & tables.I_STEREO) {
         var right_ch = granule.ch[1];
         var right_xr = xr[1];
         
-        header.flags |= FLAGS.I_STEREO;
+        header.flags |= MP3FrameHeader.FLAGS.I_STEREO;
          
         // first determine which scalefactor bands are to be processed
         if (right_ch.block_type === 2) {
@@ -7169,7 +5845,7 @@ Layer3.prototype.stereo = function(xr, granules, gr, header, sfbwidth) {
             lower = start = max = bound[0] = bound[1] = bound[2] = 0;
             sfbi = l = 0;
             
-            if (right_ch.flags & MIXED_BLOCK_FLAG) {
+            if (right_ch.flags & tables.MIXED_BLOCK_FLAG) {
                 while (l < 36) {
                     n = sfbwidth[sfbi++];
 
@@ -7208,13 +5884,13 @@ Layer3.prototype.stereo = function(xr, granules, gr, header, sfbwidth) {
 
             // long blocks
             for (i = 0; i < lower; ++i)
-                modes[i] = header.mode_extension & ~I_STEREO;
+                modes[i] = header.mode_extension & ~tables.I_STEREO;
 
             // short blocks
             w = 0;
             for (i = start; i < max; ++i) {
                 if (i < bound[w])
-                    modes[i] = header.mode_extension & ~I_STEREO;
+                    modes[i] = header.mode_extension & ~tables.I_STEREO;
 
                 w = (w + 1) % 3;
             }
@@ -7234,24 +5910,24 @@ Layer3.prototype.stereo = function(xr, granules, gr, header, sfbwidth) {
             }
 
             for (i = 0; i < bound; ++i)
-                modes[i] = header.mode_extension & ~I_STEREO;
+                modes[i] = header.mode_extension & ~tables.I_STEREO;
         }
         
         // now do the actual processing
-        if (header.flags & FLAGS.LSF_EXT) {
+        if (header.flags & MP3FrameHeader.FLAGS.LSF_EXT) {
             var illegal_pos = granules[gr + 1].ch[1].scalefac;
 
             // intensity_scale
-            var lsf_scale = IS_LSF_TABLE[right_ch.scalefac_compress & 0x1];
+            var lsf_scale = IS_Ltables.SF_TABLE[right_ch.scalefac_compress & 0x1];
             
             for (sfbi = l = 0; l < 576; ++sfbi, l += n) {
                 n = sfbwidth[sfbi];
 
-                if (!(modes[sfbi] & I_STEREO))
+                if (!(modes[sfbi] & tables.I_STEREO))
                     continue;
 
                 if (illegal_pos[sfbi]) {
-                    modes[sfbi] &= ~I_STEREO;
+                    modes[sfbi] &= ~tables.I_STEREO;
                     continue;
                 }
 
@@ -7279,35 +5955,35 @@ Layer3.prototype.stereo = function(xr, granules, gr, header, sfbwidth) {
             for (sfbi = l = 0; l < 576; ++sfbi, l += n) {
                 n = sfbwidth[sfbi];
 
-                if (!(modes[sfbi] & I_STEREO))
+                if (!(modes[sfbi] & tables.I_STEREO))
                     continue;
 
                 is_pos = right_ch.scalefac[sfbi];
 
                 if (is_pos >= 7) {  // illegal intensity position
-                    modes[sfbi] &= ~I_STEREO;
+                    modes[sfbi] &= ~tables.I_STEREO;
                     continue;
                 }
 
                 for (i = 0; i < n; ++i) {
                     var left = xr[0][l + i];
-                    xr[0][l + i] = left * IS_TABLE[is_pos];
-                    xr[1][l + i] = left * IS_TABLE[6 - is_pos];
+                    xr[0][l + i] = left * tables.IS_TABLE[is_pos];
+                    xr[1][l + i] = left * tables.IS_TABLE[6 - is_pos];
                 }
             }
         }
     }
     
     // middle/side stereo
-    if (header.mode_extension & MS_STEREO) {
-        header.flags |= FLAGS.MS_STEREO;
+    if (header.mode_extension & tables.MS_STEREO) {
+        header.flags |= tables.MS_STEREO;
 
-        var invsqrt2 = ROOT_TABLE[3 + -2];
+        var invsqrt2 = tables.ROOT_TABLE[3 + -2];
 
         for (sfbi = l = 0; l < 576; ++sfbi, l += n) {
             n = sfbwidth[sfbi];
 
-            if (modes[sfbi] !== MS_STEREO)
+            if (modes[sfbi] !== tables.MS_STEREO)
                 continue;
 
             for (i = 0; i < n; ++i) {
@@ -7327,8 +6003,8 @@ Layer3.prototype.aliasreduce = function(xr, lines) {
             var a = xr[xrPointer - i - 1];
             var b = xr[xrPointer + i];
 
-            xr[xrPointer - i - 1] = a * CS[i] - b * CA[i];
-            xr[xrPointer + i] = b * CS[i] + a * CA[i];
+            xr[xrPointer - i - 1] = a * tables.CS[i] - b * tables.CA[i];
+            xr[xrPointer + i] = b * tables.CS[i] + a * tables.CA[i];
         }
     }
 };
@@ -7341,19 +6017,19 @@ Layer3.prototype.imdct_l = function (X, z, block_type) {
     // windowing
     switch (block_type) {
         case 0:  // normal window
-            for (var i = 0; i < 36; ++i) z[i] = z[i] * WINDOW_L[i];
+            for (var i = 0; i < 36; ++i) z[i] = z[i] * tables.WINDOW_L[i];
             break;
 
         case 1:  // start block
-            for (var i =  0; i < 18; ++i) z[i] = z[i] * WINDOW_L[i];
-            for (var i = 24; i < 30; ++i) z[i] = z[i] * WINDOW_S[i - 18];
+            for (var i =  0; i < 18; ++i) z[i] = z[i] * tables.WINDOW_L[i];
+            for (var i = 24; i < 30; ++i) z[i] = z[i] * tables.WINDOW_S[i - 18];
             for (var i = 30; i < 36; ++i) z[i] = 0;
             break;
 
         case 3:  // stop block
             for (var i =  0; i <  6; ++i) z[i] = 0;
-            for (var i =  6; i < 12; ++i) z[i] = z[i] * WINDOW_S[i - 6];
-            for (var i = 18; i < 36; ++i) z[i] = z[i] * WINDOW_L[i];
+            for (var i =  6; i < 12; ++i) z[i] = z[i] * tables.WINDOW_S[i - 6];
+            for (var i = 18; i < 36; ++i) z[i] = z[i] * tables.WINDOW_L[i];
             break;
     }
 };
@@ -7361,8 +6037,7 @@ Layer3.prototype.imdct_l = function (X, z, block_type) {
 /*
  * perform IMDCT and windowing for short blocks
  */
-Layer3.prototype.imdct_s = function (X, z)
-{
+Layer3.prototype.imdct_s = function (X, z) {
     var yptr = 0;
     var wptr;
     var Xptr = 0;
@@ -7375,12 +6050,12 @@ Layer3.prototype.imdct_s = function (X, z)
         var sptr = 0;
 
         for (var i = 0; i < 3; ++i) {
-            lo = X[Xptr + 0] * IMDCT_S[sptr][0] +
-                 X[Xptr + 1] * IMDCT_S[sptr][1] +
-                 X[Xptr + 2] * IMDCT_S[sptr][2] +
-                 X[Xptr + 3] * IMDCT_S[sptr][3] +
-                 X[Xptr + 4] * IMDCT_S[sptr][4] +
-                 X[Xptr + 5] * IMDCT_S[sptr][5];
+            lo = X[Xptr + 0] * IMDCT.S[sptr][0] +
+                 X[Xptr + 1] * IMDCT.S[sptr][1] +
+                 X[Xptr + 2] * IMDCT.S[sptr][2] +
+                 X[Xptr + 3] * IMDCT.S[sptr][3] +
+                 X[Xptr + 4] * IMDCT.S[sptr][4] +
+                 X[Xptr + 5] * IMDCT.S[sptr][5];
 
 
             y[yptr + i + 0] = lo;
@@ -7388,12 +6063,12 @@ Layer3.prototype.imdct_s = function (X, z)
 
             ++sptr;
 
-            lo = X[Xptr + 0] * IMDCT_S[sptr][0] +
-                 X[Xptr + 1] * IMDCT_S[sptr][1] +
-                 X[Xptr + 2] * IMDCT_S[sptr][2] +
-                 X[Xptr + 3] * IMDCT_S[sptr][3] +
-                 X[Xptr + 4] * IMDCT_S[sptr][4] +
-                 X[Xptr + 5] * IMDCT_S[sptr][5];
+            lo = X[Xptr + 0] * IMDCT.S[sptr][0] +
+                 X[Xptr + 1] * IMDCT.S[sptr][1] +
+                 X[Xptr + 2] * IMDCT.S[sptr][2] +
+                 X[Xptr + 3] * IMDCT.S[sptr][3] +
+                 X[Xptr + 4] * IMDCT.S[sptr][4] +
+                 X[Xptr + 5] * IMDCT.S[sptr][5];
 
             y[yptr +  i + 6] = lo;
             y[yptr + 11 - i] = y[yptr + i + 6];
@@ -7411,18 +6086,18 @@ Layer3.prototype.imdct_s = function (X, z)
 
     for (var i = 0; i < 6; ++i) {
         z[i + 0] = 0;
-        z[i + 6] = y[yptr +  0 + 0] * WINDOW_S[wptr + 0];
+        z[i + 6] = y[yptr +  0 + 0] * tables.WINDOW_S[wptr + 0];
 
-        lo = y[yptr + 0 + 6] * WINDOW_S[wptr + 6] +
-             y[yptr + 12 + 0] * WINDOW_S[wptr + 0];
+        lo = y[yptr + 0 + 6] * tables.WINDOW_S[wptr + 6] +
+             y[yptr + 12 + 0] * tables.WINDOW_S[wptr + 0];
 
         z[i + 12] = lo;
 
-        lo = y[yptr + 12 + 6] * WINDOW_S[wptr + 6] +
-             y[yptr + 24 + 0] * WINDOW_S[wptr + 0];
+        lo = y[yptr + 12 + 6] * tables.WINDOW_S[wptr + 6] +
+             y[yptr + 24 + 0] * tables.WINDOW_S[wptr + 0];
 
         z[i + 18] = lo;
-        z[i + 24] = y[yptr + 24 + 6] * WINDOW_S[wptr + 6];
+        z[i + 24] = y[yptr + 24 + 6] * tables.WINDOW_S[wptr + 6];
         z[i + 30] = 0;
 
         ++yptr;
@@ -7458,7 +6133,7 @@ Layer3.prototype.reorder = function (xr, channel, sfbwidth) {
     // this is probably wrong for 8000 Hz mixed blocks
 
     var sb = 0;
-    if (channel.flags & MIXED_BLOCK_FLAG) {
+    if (channel.flags & tables.MIXED_BLOCK_FLAG) {
         var sb = 2;
 
         var l = 0;
@@ -7504,108 +6179,1573 @@ Layer3.prototype.reorder = function (xr, channel, sfbwidth) {
         xr[18 * sb + i] = tmp2[sb + i];
     }
 };
-var MP3Decoder = AV.Decoder.extend(function() {
-    AV.Decoder.register('mp3', this);
-    
-    this.prototype.init = function() {
-        this.mp3_stream = new MP3Stream(this.bitstream);
-        this.frame = new MP3Frame();
-        this.synth = new MP3Synth();
-        this.seeking = false;
-    };
-    
-    this.prototype.readChunk = function() {
-        var stream = this.mp3_stream;
-        var frame = this.frame;
-        var synth = this.synth;
 
-        // if we just seeked, we may start getting errors involving the frame reservoir,
-        // so keep going until we successfully decode a frame
-        if (this.seeking) {
-            while (true) {
-                try {
-                    frame.decode(stream);
-                    break;
-                } catch (err) {
-                    if (err instanceof AV.UnderflowError)
-                        throw err;
-                }
-            }
-            
-            this.seeking = false;
-        } else {
-            frame.decode(stream);
-        }
-        
-        synth.frame(frame);
-        
-        // interleave samples
-        var data = synth.pcm.samples,
-            channels = synth.pcm.channels,
-            len = synth.pcm.length,
-            output = new Float32Array(len * channels),
-            j = 0;
-        
-        for (var k = 0; k < len; k++) {
-            for (var i = 0; i < channels; i++) {
-                output[j++] = data[i][k];
-            }
-        }
-        
-        return output;
-    };
+module.exports = Layer3;
+
+}).call(this,typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{"./frame":4,"./header":5,"./huffman":6,"./imdct":8,"./tables":14,"./utils":15}],12:[function(require,module,exports){
+(function (global){
+var AV = (typeof window !== "undefined" ? window['AV'] : typeof global !== "undefined" ? global['AV'] : null);
+var MP3FrameHeader = require('./header');
+
+function MP3Stream(stream) {
+    this.stream = stream;                     // actual bitstream
+    this.sync = false;                        // stream sync found
+    this.freerate = 0;                        // free bitrate (fixed)
+    this.this_frame = stream.stream.offset;   // start of current frame
+    this.next_frame = stream.stream.offset;   // start of next frame
     
-    this.prototype.seek = function(timestamp) {
-        var offset;
+    this.main_data = new Uint8Array(MP3FrameHeader.BUFFER_MDLEN); // actual audio data
+    this.md_len = 0;                               // length of main data
+    
+    // copy methods from actual stream
+    for (var key in stream) {
+        if (typeof stream[key] === 'function')
+            this[key] = stream[key].bind(stream);
+    }
+}
+
+MP3Stream.prototype.getU8 = function(offset) {
+    var stream = this.stream.stream;
+    return stream.peekUInt8(offset - stream.offset);
+};
+
+MP3Stream.prototype.nextByte = function() {
+    var stream = this.stream;
+    return stream.bitPosition === 0 ? stream.stream.offset : stream.stream.offset + 1;
+};
+
+MP3Stream.prototype.doSync = function() {
+    var stream = this.stream.stream;
+    this.align();
+    
+    while (this.available(16) && !(stream.peekUInt8(0) === 0xff && (stream.peekUInt8(1) & 0xe0) === 0xe0)) {
+        this.advance(8);
+    }
+
+    if (!this.available(MP3FrameHeader.BUFFER_GUARD))
+        return false;
         
-        // if there was a Xing or VBRI tag with a seek table, use that
-        // otherwise guesstimate based on CBR bitrate
-        if (this.demuxer.seekPoints.length > 0) {
-            timestamp = this._super(timestamp);
-            offset = this.stream.offset;
-        } else {
-            offset = timestamp * this.format.bitrate / 8 / this.format.sampleRate;
-        }
-        
-        this.mp3_stream.reset(offset);
-        
-        // try to find 3 consecutive valid frame headers in a row
-        for (var i = 0; i < 4096; i++) {
-            var pos = offset + i;
-            for (var j = 0; j < 3; j++) {
-                this.mp3_stream.reset(pos);
-                
-                try {
-                    var header = MP3FrameHeader.decode(this.mp3_stream);
-                } catch (e) {
-                    break;
-                }
-                
-                // skip the rest of the frame
-                var size = header.framesize();
-                if (size == null)
-                    break;
-                        
-                pos += size;
-            }
-            
-            // check if we're done
-            if (j === 3)
-                break;
-        }
-        
-        // if we didn't find 3 frames, just try the first one and hope for the best
-        if (j !== 3)
-            i = 0;
-            
-        this.mp3_stream.reset(offset + i);
-        
-        // if we guesstimated, update the timestamp to another estimate of where we actually seeked to
-        if (this.demuxer.seekPoints.length === 0)
-            timestamp = this.stream.offset / (this.format.bitrate / 8) * this.format.sampleRate;
-        
-        this.seeking = true;
-        return timestamp;
+    return true;
+};
+
+MP3Stream.prototype.reset = function(byteOffset) {
+    this.seek(byteOffset * 8);
+    this.next_frame = byteOffset;
+    this.sync = true;
+};
+
+module.exports = MP3Stream;
+
+}).call(this,typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{"./header":5}],13:[function(require,module,exports){
+var utils = require('./utils');
+
+function MP3Synth() {
+    this.filter = utils.makeArray([2, 2, 2, 16, 8]); // polyphase filterbank outputs
+    this.phase = 0;
+    
+    this.pcm = {
+        samplerate: 0,
+        channels: 0,
+        length: 0,
+        samples: [new Float64Array(1152), new Float64Array(1152)]
     };
-});
-})();
+}
+
+/* costab[i] = cos(PI / (2 * 32) * i) */
+const costab1  = 0.998795456;
+const costab2  = 0.995184727;
+const costab3  = 0.989176510;
+const costab4  = 0.980785280;
+const costab5  = 0.970031253;
+const costab6  = 0.956940336;
+const costab7  = 0.941544065;
+const costab8  = 0.923879533;
+const costab9  = 0.903989293;
+const costab10 = 0.881921264;
+const costab11 = 0.857728610;
+const costab12 = 0.831469612;
+const costab13 = 0.803207531;
+const costab14 = 0.773010453;
+const costab15 = 0.740951125;
+const costab16 = 0.707106781;
+const costab17 = 0.671558955;
+const costab18 = 0.634393284;
+const costab19 = 0.595699304;
+const costab20 = 0.555570233;
+const costab21 = 0.514102744;
+const costab22 = 0.471396737;
+const costab23 = 0.427555093;
+const costab24 = 0.382683432;
+const costab25 = 0.336889853;
+const costab26 = 0.290284677;
+const costab27 = 0.242980180;
+const costab28 = 0.195090322;
+const costab29 = 0.146730474;
+const costab30 = 0.098017140;
+const costab31 = 0.049067674;
+
+/*
+ * NAME:    dct32()
+ * DESCRIPTION: perform fast in[32].out[32] DCT
+ */
+MP3Synth.dct32 = function (_in, slot, lo, hi) {
+    var t0,   t1,   t2,   t3,   t4,   t5,   t6,   t7;
+    var t8,   t9,   t10,  t11,  t12,  t13,  t14,  t15;
+    var t16,  t17,  t18,  t19,  t20,  t21,  t22,  t23;
+    var t24,  t25,  t26,  t27,  t28,  t29,  t30,  t31;
+    var t32,  t33,  t34,  t35,  t36,  t37,  t38,  t39;
+    var t40,  t41,  t42,  t43,  t44,  t45,  t46,  t47;
+    var t48,  t49,  t50,  t51,  t52,  t53,  t54,  t55;
+    var t56,  t57,  t58,  t59,  t60,  t61,  t62,  t63;
+    var t64,  t65,  t66,  t67,  t68,  t69,  t70,  t71;
+    var t72,  t73,  t74,  t75,  t76,  t77,  t78,  t79;
+    var t80,  t81,  t82,  t83,  t84,  t85,  t86,  t87;
+    var t88,  t89,  t90,  t91,  t92,  t93,  t94,  t95;
+    var t96,  t97,  t98,  t99,  t100, t101, t102, t103;
+    var t104, t105, t106, t107, t108, t109, t110, t111;
+    var t112, t113, t114, t115, t116, t117, t118, t119;
+    var t120, t121, t122, t123, t124, t125, t126, t127;
+    var t128, t129, t130, t131, t132, t133, t134, t135;
+    var t136, t137, t138, t139, t140, t141, t142, t143;
+    var t144, t145, t146, t147, t148, t149, t150, t151;
+    var t152, t153, t154, t155, t156, t157, t158, t159;
+    var t160, t161, t162, t163, t164, t165, t166, t167;
+    var t168, t169, t170, t171, t172, t173, t174, t175;
+    var t176;
+
+    t0   = _in[0]  + _in[31];  t16  = ((_in[0]  - _in[31]) * (costab1));
+    t1   = _in[15] + _in[16];  t17  = ((_in[15] - _in[16]) * (costab31));
+
+    t41  = t16 + t17;
+    t59  = ((t16 - t17) * (costab2));
+    t33  = t0  + t1;
+    t50  = ((t0  - t1) * ( costab2));
+
+    t2   = _in[7]  + _in[24];  t18  = ((_in[7]  - _in[24]) * (costab15));
+    t3   = _in[8]  + _in[23];  t19  = ((_in[8]  - _in[23]) * (costab17));
+
+    t42  = t18 + t19;
+    t60  = ((t18 - t19) * (costab30));
+    t34  = t2  + t3;
+    t51  = ((t2  - t3) * ( costab30));
+
+    t4   = _in[3]  + _in[28];  t20  = ((_in[3]  - _in[28]) * (costab7));
+    t5   = _in[12] + _in[19];  t21  = ((_in[12] - _in[19]) * (costab25));
+
+    t43  = t20 + t21;
+    t61  = ((t20 - t21) * (costab14));
+    t35  = t4  + t5;
+    t52  = ((t4  - t5) * ( costab14));
+
+    t6   = _in[4]  + _in[27];  t22  = ((_in[4]  - _in[27]) * (costab9));
+    t7   = _in[11] + _in[20];  t23  = ((_in[11] - _in[20]) * (costab23));
+
+    t44  = t22 + t23;
+    t62  = ((t22 - t23) * (costab18));
+    t36  = t6  + t7;
+    t53  = ((t6  - t7) * ( costab18));
+
+    t8   = _in[1]  + _in[30];  t24  = ((_in[1]  - _in[30]) * (costab3));
+    t9   = _in[14] + _in[17];  t25  = ((_in[14] - _in[17]) * (costab29));
+
+    t45  = t24 + t25;
+    t63  = ((t24 - t25) * (costab6));
+    t37  = t8  + t9;
+    t54  = ((t8  - t9) * ( costab6));
+
+    t10  = _in[6]  + _in[25];  t26  = ((_in[6]  - _in[25]) * (costab13));
+    t11  = _in[9]  + _in[22];  t27  = ((_in[9]  - _in[22]) * (costab19));
+
+    t46  = t26 + t27;
+    t64  = ((t26 - t27) * (costab26));
+    t38  = t10 + t11;
+    t55  = ((t10 - t11) * (costab26));
+
+    t12  = _in[2]  + _in[29];  t28  = ((_in[2]  - _in[29]) * (costab5));
+    t13  = _in[13] + _in[18];  t29  = ((_in[13] - _in[18]) * (costab27));
+
+    t47  = t28 + t29;
+    t65  = ((t28 - t29) * (costab10));
+    t39  = t12 + t13;
+    t56  = ((t12 - t13) * (costab10));
+
+    t14  = _in[5]  + _in[26];  t30  = ((_in[5]  - _in[26]) * (costab11));
+    t15  = _in[10] + _in[21];  t31  = ((_in[10] - _in[21]) * (costab21));
+
+    t48  = t30 + t31;
+    t66  = ((t30 - t31) * (costab22));
+    t40  = t14 + t15;
+    t57  = ((t14 - t15) * (costab22));
+
+    t69  = t33 + t34;  t89  = ((t33 - t34) * (costab4));
+    t70  = t35 + t36;  t90  = ((t35 - t36) * (costab28));
+    t71  = t37 + t38;  t91  = ((t37 - t38) * (costab12));
+    t72  = t39 + t40;  t92  = ((t39 - t40) * (costab20));
+    t73  = t41 + t42;  t94  = ((t41 - t42) * (costab4));
+    t74  = t43 + t44;  t95  = ((t43 - t44) * (costab28));
+    t75  = t45 + t46;  t96  = ((t45 - t46) * (costab12));
+    t76  = t47 + t48;  t97  = ((t47 - t48) * (costab20));
+
+    t78  = t50 + t51;  t100 = ((t50 - t51) * (costab4));
+    t79  = t52 + t53;  t101 = ((t52 - t53) * (costab28));
+    t80  = t54 + t55;  t102 = ((t54 - t55) * (costab12));
+    t81  = t56 + t57;  t103 = ((t56 - t57) * (costab20));
+
+    t83  = t59 + t60;  t106 = ((t59 - t60) * (costab4));
+    t84  = t61 + t62;  t107 = ((t61 - t62) * (costab28));
+    t85  = t63 + t64;  t108 = ((t63 - t64) * (costab12));
+    t86  = t65 + t66;  t109 = ((t65 - t66) * (costab20));
+
+    t113 = t69  + t70;
+    t114 = t71  + t72;
+
+    /*  0 */ hi[15][slot] = t113 + t114;
+    /* 16 */ lo[ 0][slot] = ((t113 - t114) * (costab16));
+
+    t115 = t73  + t74;
+    t116 = t75  + t76;
+
+    t32  = t115 + t116;
+
+    /*  1 */ hi[14][slot] = t32;
+
+    t118 = t78  + t79;
+    t119 = t80  + t81;
+
+    t58  = t118 + t119;
+
+    /*  2 */ hi[13][slot] = t58;
+
+    t121 = t83  + t84;
+    t122 = t85  + t86;
+
+    t67  = t121 + t122;
+
+    t49  = (t67 * 2) - t32;
+
+    /*  3 */ hi[12][slot] = t49;
+
+    t125 = t89  + t90;
+    t126 = t91  + t92;
+
+    t93  = t125 + t126;
+
+    /*  4 */ hi[11][slot] = t93;
+
+    t128 = t94  + t95;
+    t129 = t96  + t97;
+
+    t98  = t128 + t129;
+
+    t68  = (t98 * 2) - t49;
+
+    /*  5 */ hi[10][slot] = t68;
+
+    t132 = t100 + t101;
+    t133 = t102 + t103;
+
+    t104 = t132 + t133;
+
+    t82  = (t104 * 2) - t58;
+
+    /*  6 */ hi[ 9][slot] = t82;
+
+    t136 = t106 + t107;
+    t137 = t108 + t109;
+
+    t110 = t136 + t137;
+
+    t87  = (t110 * 2) - t67;
+
+    t77  = (t87 * 2) - t68;
+
+    /*  7 */ hi[ 8][slot] = t77;
+
+    t141 = ((t69 - t70) * (costab8));
+    t142 = ((t71 - t72) * (costab24));
+    t143 = t141 + t142;
+
+    /*  8 */ hi[ 7][slot] = t143;
+    /* 24 */ lo[ 8][slot] =
+        (((t141 - t142) * (costab16) * 2)) - t143;
+
+    t144 = ((t73 - t74) * (costab8));
+    t145 = ((t75 - t76) * (costab24));
+    t146 = t144 + t145;
+
+    t88  = (t146 * 2) - t77;
+
+    /*  9 */ hi[ 6][slot] = t88;
+
+    t148 = ((t78 - t79) * (costab8));
+    t149 = ((t80 - t81) * (costab24));
+    t150 = t148 + t149;
+
+    t105 = (t150 * 2) - t82;
+
+    /* 10 */ hi[ 5][slot] = t105;
+
+    t152 = ((t83 - t84) * (costab8));
+    t153 = ((t85 - t86) * (costab24));
+    t154 = t152 + t153;
+
+    t111 = (t154 * 2) - t87;
+
+    t99  = (t111 * 2) - t88;
+
+    /* 11 */ hi[ 4][slot] = t99;
+
+    t157 = ((t89 - t90) * (costab8));
+    t158 = ((t91 - t92) * (costab24));
+    t159 = t157 + t158;
+
+    t127 = (t159 * 2) - t93;
+
+    /* 12 */ hi[ 3][slot] = t127;
+
+    t160 = (((t125 - t126) * (costab16) * 2)) - t127;
+
+    /* 20 */ lo[ 4][slot] = t160;
+    /* 28 */ lo[12][slot] =
+        (((((t157 - t158) * (costab16) * 2) - t159) * 2)) - t160;
+
+    t161 = ((t94 - t95) * (costab8));
+    t162 = ((t96 - t97) * (costab24));
+    t163 = t161 + t162;
+
+    t130 = (t163 * 2) - t98;
+
+    t112 = (t130 * 2) - t99;
+
+    /* 13 */ hi[ 2][slot] = t112;
+
+    t164 = (((t128 - t129) * (costab16) * 2)) - t130;
+
+    t166 = ((t100 - t101) * (costab8));
+    t167 = ((t102 - t103) * (costab24));
+    t168 = t166 + t167;
+
+    t134 = (t168 * 2) - t104;
+
+    t120 = (t134 * 2) - t105;
+
+    /* 14 */ hi[ 1][slot] = t120;
+
+    t135 = (((t118 - t119) * (costab16) * 2)) - t120;
+
+    /* 18 */ lo[ 2][slot] = t135;
+
+    t169 = (((t132 - t133) * (costab16) * 2)) - t134;
+
+    t151 = (t169 * 2) - t135;
+
+    /* 22 */ lo[ 6][slot] = t151;
+
+    t170 = (((((t148 - t149) * (costab16) * 2) - t150) * 2)) - t151;
+
+    /* 26 */ lo[10][slot] = t170;
+    /* 30 */ lo[14][slot] =
+        (((((((t166 - t167) * (costab16)) * 2 -
+             t168) * 2) - t169) * 2) - t170);
+
+    t171 = ((t106 - t107) * (costab8));
+    t172 = ((t108 - t109) * (costab24));
+    t173 = t171 + t172;
+
+    t138 = (t173 * 2) - t110;
+    t123 = (t138 * 2) - t111;
+    t139 = (((t121 - t122) * (costab16) * 2)) - t123;
+    t117 = (t123 * 2) - t112;
+
+    /* 15 */ hi[ 0][slot] = t117;
+
+    t124 = (((t115 - t116) * (costab16) * 2)) - t117;
+
+    /* 17 */ lo[ 1][slot] = t124;
+
+    t131 = (t139 * 2) - t124;
+
+    /* 19 */ lo[ 3][slot] = t131;
+
+    t140 = (t164 * 2) - t131;
+
+    /* 21 */ lo[ 5][slot] = t140;
+
+    t174 = (((t136 - t137) * (costab16) * 2)) - t138;
+    t155 = (t174 * 2) - t139;
+    t147 = (t155 * 2) - t140;
+
+    /* 23 */ lo[ 7][slot] = t147;
+
+    t156 = (((((t144 - t145) * (costab16) * 2) - t146) * 2)) - t147;
+
+    /* 25 */ lo[ 9][slot] = t156;
+
+    t175 = (((((t152 - t153) * (costab16) * 2) - t154) * 2)) - t155;
+    t165 = (t175 * 2) - t156;
+
+    /* 27 */ lo[11][slot] = t165;
+
+    t176 = (((((((t161 - t162) * (costab16) * 2)) -
+               t163) * 2) - t164) * 2) - t165;
+
+    /* 29 */ lo[13][slot] = t176;
+    /* 31 */ lo[15][slot] =
+        (((((((((t171 - t172) * (costab16)) * 2 -
+               t173) * 2) - t174) * 2) - t175) * 2) - t176);
+
+    /*
+     * Totals:
+     *  80 multiplies
+     *  80 additions
+     * 119 subtractions
+     *  49 shifts (not counting SSO)
+     */
+};
+
+/*
+ * These are the coefficients for the subband synthesis window. This is a
+ * reordered version of Table B.3 from ISO/IEC 11172-3.
+ */
+const D = [
+    [  0.000000000,   /*  0 */
+       -0.000442505,
+       0.003250122,
+       -0.007003784,
+       0.031082153,
+       -0.078628540,
+       0.100311279,
+       -0.572036743,
+       1.144989014,
+       0.572036743,
+       0.100311279,
+       0.078628540,
+       0.031082153,
+       0.007003784,
+       0.003250122,
+       0.000442505,
+
+       0.000000000,
+       -0.000442505,
+       0.003250122,
+       -0.007003784,
+       0.031082153,
+       -0.078628540,
+       0.100311279,
+       -0.572036743,
+       1.144989014,
+       0.572036743,
+       0.100311279,
+       0.078628540,
+       0.031082153,
+       0.007003784,
+       0.003250122,
+       0.000442505 ],
+
+    [ -0.000015259,   /*  1 */
+      -0.000473022,
+      0.003326416,
+      -0.007919312,
+      0.030517578,
+      -0.084182739,
+      0.090927124,
+      -0.600219727,
+      1.144287109,
+      0.543823242,
+      0.108856201,
+      0.073059082,
+      0.031478882,
+      0.006118774,
+      0.003173828,
+      0.000396729,
+
+      -0.000015259,
+      -0.000473022,
+      0.003326416,
+      -0.007919312,
+      0.030517578,
+      -0.084182739,
+      0.090927124,
+      -0.600219727,
+      1.144287109,
+      0.543823242,
+      0.108856201,
+      0.073059082,
+      0.031478882,
+      0.006118774,
+      0.003173828,
+      0.000396729 ],
+
+    [ -0.000015259,   /*  2 */
+      -0.000534058,
+      0.003387451,
+      -0.008865356,
+      0.029785156,
+      -0.089706421,
+      0.080688477,
+      -0.628295898,
+      1.142211914,
+      0.515609741,
+      0.116577148,
+      0.067520142,
+      0.031738281,
+      0.005294800,
+      0.003082275,
+      0.000366211,
+
+      -0.000015259,
+      -0.000534058,
+      0.003387451,
+      -0.008865356,
+      0.029785156,
+      -0.089706421,
+      0.080688477,
+      -0.628295898,
+      1.142211914,
+      0.515609741,
+      0.116577148,
+      0.067520142,
+      0.031738281,
+      0.005294800,
+      0.003082275,
+      0.000366211 ],
+
+    [ -0.000015259,   /*  3 */
+      -0.000579834,
+      0.003433228,
+      -0.009841919,
+      0.028884888,
+      -0.095169067,
+      0.069595337,
+      -0.656219482,
+      1.138763428,
+      0.487472534,
+      0.123474121,
+      0.061996460,
+      0.031845093,
+      0.004486084,
+      0.002990723,
+      0.000320435,
+
+      -0.000015259,
+      -0.000579834,
+      0.003433228,
+      -0.009841919,
+      0.028884888,
+      -0.095169067,
+      0.069595337,
+      -0.656219482,
+      1.138763428,
+      0.487472534,
+      0.123474121,
+      0.061996460,
+      0.031845093,
+      0.004486084,
+      0.002990723,
+      0.000320435 ],
+
+    [ -0.000015259,   /*  4 */
+      -0.000625610,
+      0.003463745,
+      -0.010848999,
+      0.027801514,
+      -0.100540161,
+      0.057617187,
+      -0.683914185,
+      1.133926392,
+      0.459472656,
+      0.129577637,
+      0.056533813,
+      0.031814575,
+      0.003723145,
+      0.002899170,
+      0.000289917,
+
+      -0.000015259,
+      -0.000625610,
+      0.003463745,
+      -0.010848999,
+      0.027801514,
+      -0.100540161,
+      0.057617187,
+      -0.683914185,
+      1.133926392,
+      0.459472656,
+      0.129577637,
+      0.056533813,
+      0.031814575,
+      0.003723145,
+      0.002899170,
+      0.000289917 ],
+
+    [ -0.000015259,   /*  5 */
+      -0.000686646,
+      0.003479004,
+      -0.011886597,
+      0.026535034,
+      -0.105819702,
+      0.044784546,
+      -0.711318970,
+      1.127746582,
+      0.431655884,
+      0.134887695,
+      0.051132202,
+      0.031661987,
+      0.003005981,
+      0.002792358,
+      0.000259399,
+
+      -0.000015259,
+      -0.000686646,
+      0.003479004,
+      -0.011886597,
+      0.026535034,
+      -0.105819702,
+      0.044784546,
+      -0.711318970,
+      1.127746582,
+      0.431655884,
+      0.134887695,
+      0.051132202,
+      0.031661987,
+      0.003005981,
+      0.002792358,
+      0.000259399 ],
+
+    [ -0.000015259,   /*  6 */
+      -0.000747681,
+      0.003479004,
+      -0.012939453,
+      0.025085449,
+      -0.110946655,
+      0.031082153,
+      -0.738372803,
+      1.120223999,
+      0.404083252,
+      0.139450073,
+      0.045837402,
+      0.031387329,
+      0.002334595,
+      0.002685547,
+      0.000244141,
+
+      -0.000015259,
+      -0.000747681,
+      0.003479004,
+      -0.012939453,
+      0.025085449,
+      -0.110946655,
+      0.031082153,
+      -0.738372803,
+      1.120223999,
+      0.404083252,
+      0.139450073,
+      0.045837402,
+      0.031387329,
+      0.002334595,
+      0.002685547,
+      0.000244141 ],
+
+    [ -0.000030518,   /*  7 */
+      -0.000808716,
+      0.003463745,
+      -0.014022827,
+      0.023422241,
+      -0.115921021,
+      0.016510010,
+      -0.765029907,
+      1.111373901,
+      0.376800537,
+      0.143264771,
+      0.040634155,
+      0.031005859,
+      0.001693726,
+      0.002578735,
+      0.000213623,
+
+      -0.000030518,
+      -0.000808716,
+      0.003463745,
+      -0.014022827,
+      0.023422241,
+      -0.115921021,
+      0.016510010,
+      -0.765029907,
+      1.111373901,
+      0.376800537,
+      0.143264771,
+      0.040634155,
+      0.031005859,
+      0.001693726,
+      0.002578735,
+      0.000213623 ],
+
+    [ -0.000030518,   /*  8 */
+      -0.000885010,
+      0.003417969,
+      -0.015121460,
+      0.021575928,
+      -0.120697021,
+      0.001068115,
+      -0.791213989,
+      1.101211548,
+      0.349868774,
+      0.146362305,
+      0.035552979,
+      0.030532837,
+      0.001098633,
+      0.002456665,
+      0.000198364,
+
+      -0.000030518,
+      -0.000885010,
+      0.003417969,
+      -0.015121460,
+      0.021575928,
+      -0.120697021,
+      0.001068115,
+      -0.791213989,
+      1.101211548,
+      0.349868774,
+      0.146362305,
+      0.035552979,
+      0.030532837,
+      0.001098633,
+      0.002456665,
+      0.000198364 ],
+
+    [ -0.000030518,   /*  9 */
+      -0.000961304,
+      0.003372192,
+      -0.016235352,
+      0.019531250,
+      -0.125259399,
+      -0.015228271,
+      -0.816864014,
+      1.089782715,
+      0.323318481,
+      0.148773193,
+      0.030609131,
+      0.029937744,
+      0.000549316,
+      0.002349854,
+      0.000167847,
+
+      -0.000030518,
+      -0.000961304,
+      0.003372192,
+      -0.016235352,
+      0.019531250,
+      -0.125259399,
+      -0.015228271,
+      -0.816864014,
+      1.089782715,
+      0.323318481,
+      0.148773193,
+      0.030609131,
+      0.029937744,
+      0.000549316,
+      0.002349854,
+      0.000167847 ],
+
+    [ -0.000030518,   /* 10 */
+      -0.001037598,
+      0.003280640,
+      -0.017349243,
+      0.017257690,
+      -0.129562378,
+      -0.032379150,
+      -0.841949463,
+      1.077117920,
+      0.297210693,
+      0.150497437,
+      0.025817871,
+      0.029281616,
+      0.000030518,
+      0.002243042,
+      0.000152588,
+
+      -0.000030518,
+      -0.001037598,
+      0.003280640,
+      -0.017349243,
+      0.017257690,
+      -0.129562378,
+      -0.032379150,
+      -0.841949463,
+      1.077117920,
+      0.297210693,
+      0.150497437,
+      0.025817871,
+      0.029281616,
+      0.000030518,
+      0.002243042,
+      0.000152588 ],
+
+    [ -0.000045776,   /* 11 */
+      -0.001113892,
+      0.003173828,
+      -0.018463135,
+      0.014801025,
+      -0.133590698,
+      -0.050354004,
+      -0.866363525,
+      1.063217163,
+      0.271591187,
+      0.151596069,
+      0.021179199,
+      0.028533936,
+      -0.000442505,
+      0.002120972,
+      0.000137329,
+
+      -0.000045776,
+      -0.001113892,
+      0.003173828,
+      -0.018463135,
+      0.014801025,
+      -0.133590698,
+      -0.050354004,
+      -0.866363525,
+      1.063217163,
+      0.271591187,
+      0.151596069,
+      0.021179199,
+      0.028533936,
+      -0.000442505,
+      0.002120972,
+      0.000137329 ],
+
+    [ -0.000045776,   /* 12 */
+      -0.001205444,
+      0.003051758,
+      -0.019577026,
+      0.012115479,
+      -0.137298584,
+      -0.069168091,
+      -0.890090942,
+      1.048156738,
+      0.246505737,
+      0.152069092,
+      0.016708374,
+      0.027725220,
+      -0.000869751,
+      0.002014160,
+      0.000122070,
+
+      -0.000045776,
+      -0.001205444,
+      0.003051758,
+      -0.019577026,
+      0.012115479,
+      -0.137298584,
+      -0.069168091,
+      -0.890090942,
+      1.048156738,
+      0.246505737,
+      0.152069092,
+      0.016708374,
+      0.027725220,
+      -0.000869751,
+      0.002014160,
+      0.000122070 ],
+
+    [ -0.000061035,   /* 13 */
+      -0.001296997,
+      0.002883911,
+      -0.020690918,
+      0.009231567,
+      -0.140670776,
+      -0.088775635,
+      -0.913055420,
+      1.031936646,
+      0.221984863,
+      0.151962280,
+      0.012420654,
+      0.026840210,
+      -0.001266479,
+      0.001907349,
+      0.000106812,
+
+      -0.000061035,
+      -0.001296997,
+      0.002883911,
+      -0.020690918,
+      0.009231567,
+      -0.140670776,
+      -0.088775635,
+      -0.913055420,
+      1.031936646,
+      0.221984863,
+      0.151962280,
+      0.012420654,
+      0.026840210,
+      -0.001266479,
+      0.001907349,
+      0.000106812 ],
+
+    [ -0.000061035,   /* 14 */
+      -0.001388550,
+      0.002700806,
+      -0.021789551,
+      0.006134033,
+      -0.143676758,
+      -0.109161377,
+      -0.935195923,
+      1.014617920,
+      0.198059082,
+      0.151306152,
+      0.008316040,
+      0.025909424,
+      -0.001617432,
+      0.001785278,
+      0.000106812,
+
+      -0.000061035,
+      -0.001388550,
+      0.002700806,
+      -0.021789551,
+      0.006134033,
+      -0.143676758,
+      -0.109161377,
+      -0.935195923,
+      1.014617920,
+      0.198059082,
+      0.151306152,
+      0.008316040,
+      0.025909424,
+      -0.001617432,
+      0.001785278,
+      0.000106812 ],
+
+    [ -0.000076294,   /* 15 */
+      -0.001480103,
+      0.002487183,
+      -0.022857666,
+      0.002822876,
+      -0.146255493,
+      -0.130310059,
+      -0.956481934,
+      0.996246338,
+      0.174789429,
+      0.150115967,
+      0.004394531,
+      0.024932861,
+      -0.001937866,
+      0.001693726,
+      0.000091553,
+
+      -0.000076294,
+      -0.001480103,
+      0.002487183,
+      -0.022857666,
+      0.002822876,
+      -0.146255493,
+      -0.130310059,
+      -0.956481934,
+      0.996246338,
+      0.174789429,
+      0.150115967,
+      0.004394531,
+      0.024932861,
+      -0.001937866,
+      0.001693726,
+      0.000091553 ],
+
+    [ -0.000076294,   /* 16 */
+      -0.001586914,
+      0.002227783,
+      -0.023910522,
+      -0.000686646,
+      -0.148422241,
+      -0.152206421,
+      -0.976852417,
+      0.976852417,
+      0.152206421,
+      0.148422241,
+      0.000686646,
+      0.023910522,
+      -0.002227783,
+      0.001586914,
+      0.000076294,
+
+      -0.000076294,
+      -0.001586914,
+      0.002227783,
+      -0.023910522,
+      -0.000686646,
+      -0.148422241,
+      -0.152206421,
+      -0.976852417,
+      0.976852417,
+      0.152206421,
+      0.148422241,
+      0.000686646,
+      0.023910522,
+      -0.002227783,
+      0.001586914,
+      0.000076294 ]
+];
+
+/*
+ * perform full frequency PCM synthesis
+ */
+MP3Synth.prototype.full = function(frame, nch, ns) {
+    var Dptr, hi, lo, ptr;
+    
+    for (var ch = 0; ch < nch; ++ch) {
+        var sbsample = frame.sbsample[ch];
+        var filter  = this.filter[ch];
+        var phase   = this.phase;
+        var pcm     = this.pcm.samples[ch];
+        var pcm1Ptr = 0;
+        var pcm2Ptr = 0;
+
+        for (var s = 0; s < ns; ++s) {
+            MP3Synth.dct32(sbsample[s], phase >> 1, filter[0][phase & 1], filter[1][phase & 1]);
+
+            var pe = phase & ~1;
+            var po = ((phase - 1) & 0xf) | 1;
+
+            /* calculate 32 samples */
+            var fe = filter[0][ phase & 1];
+            var fx = filter[0][~phase & 1];
+            var fo = filter[1][~phase & 1];
+
+            var fePtr = 0;
+            var fxPtr = 0;
+            var foPtr = 0;
+            
+            Dptr = 0;
+
+            ptr = D[Dptr];
+            _fx = fx[fxPtr];
+            _fe = fe[fePtr];
+
+            lo =  _fx[0] * ptr[po +  0];
+            lo += _fx[1] * ptr[po + 14];
+            lo += _fx[2] * ptr[po + 12];
+            lo += _fx[3] * ptr[po + 10];
+            lo += _fx[4] * ptr[po +  8];
+            lo += _fx[5] * ptr[po +  6];
+            lo += _fx[6] * ptr[po +  4];
+            lo += _fx[7] * ptr[po +  2];
+            lo = -lo;                      
+            
+            lo += _fe[0] * ptr[pe +  0];
+            lo += _fe[1] * ptr[pe + 14];
+            lo += _fe[2] * ptr[pe + 12];
+            lo += _fe[3] * ptr[pe + 10];
+            lo += _fe[4] * ptr[pe +  8];
+            lo += _fe[5] * ptr[pe +  6];
+            lo += _fe[6] * ptr[pe +  4];
+            lo += _fe[7] * ptr[pe +  2];
+
+            pcm[pcm1Ptr++] = lo;
+            pcm2Ptr = pcm1Ptr + 30;
+
+            for (var sb = 1; sb < 16; ++sb) {
+                ++fePtr;
+                ++Dptr;
+
+                /* D[32 - sb][i] === -D[sb][31 - i] */
+
+                ptr = D[Dptr];
+                _fo = fo[foPtr];
+                _fe = fe[fePtr];
+
+                lo  = _fo[0] * ptr[po +  0];
+                lo += _fo[1] * ptr[po + 14];
+                lo += _fo[2] * ptr[po + 12];
+                lo += _fo[3] * ptr[po + 10];
+                lo += _fo[4] * ptr[po +  8];
+                lo += _fo[5] * ptr[po +  6];
+                lo += _fo[6] * ptr[po +  4];
+                lo += _fo[7] * ptr[po +  2];
+                lo = -lo;
+
+                lo += _fe[7] * ptr[pe + 2];
+                lo += _fe[6] * ptr[pe + 4];
+                lo += _fe[5] * ptr[pe + 6];
+                lo += _fe[4] * ptr[pe + 8];
+                lo += _fe[3] * ptr[pe + 10];
+                lo += _fe[2] * ptr[pe + 12];
+                lo += _fe[1] * ptr[pe + 14];
+                lo += _fe[0] * ptr[pe + 0];
+
+                pcm[pcm1Ptr++] = lo;
+
+                lo =  _fe[0] * ptr[-pe + 31 - 16];
+                lo += _fe[1] * ptr[-pe + 31 - 14];
+                lo += _fe[2] * ptr[-pe + 31 - 12];
+                lo += _fe[3] * ptr[-pe + 31 - 10];
+                lo += _fe[4] * ptr[-pe + 31 -  8];
+                lo += _fe[5] * ptr[-pe + 31 -  6];
+                lo += _fe[6] * ptr[-pe + 31 -  4];
+                lo += _fe[7] * ptr[-pe + 31 -  2];
+
+                lo += _fo[7] * ptr[-po + 31 -  2];
+                lo += _fo[6] * ptr[-po + 31 -  4];
+                lo += _fo[5] * ptr[-po + 31 -  6];
+                lo += _fo[4] * ptr[-po + 31 -  8];
+                lo += _fo[3] * ptr[-po + 31 - 10];
+                lo += _fo[2] * ptr[-po + 31 - 12];
+                lo += _fo[1] * ptr[-po + 31 - 14];
+                lo += _fo[0] * ptr[-po + 31 - 16];
+
+                pcm[pcm2Ptr--] = lo;
+                ++foPtr;
+            }
+
+            ++Dptr;
+
+            ptr = D[Dptr];
+            _fo = fo[foPtr];
+
+            lo  = _fo[0] * ptr[po +  0];
+            lo += _fo[1] * ptr[po + 14];
+            lo += _fo[2] * ptr[po + 12];
+            lo += _fo[3] * ptr[po + 10];
+            lo += _fo[4] * ptr[po +  8];
+            lo += _fo[5] * ptr[po +  6];
+            lo += _fo[6] * ptr[po +  4];
+            lo += _fo[7] * ptr[po +  2];
+
+            pcm[pcm1Ptr] = -lo;
+            pcm1Ptr += 16;
+            phase = (phase + 1) % 16;
+        }
+    }
+};
+
+// TODO: synth.half()
+
+/*
+ * NAME:    synth.frame()
+ * DESCRIPTION: perform PCM synthesis of frame subband samples
+ */
+MP3Synth.prototype.frame = function (frame) {
+    var nch = frame.header.nchannels();
+    var ns  = frame.header.nbsamples();
+
+    this.pcm.samplerate = frame.header.samplerate;
+    this.pcm.channels   = nch;
+    this.pcm.length     = 32 * ns;
+
+    /*
+     if (frame.options & Mad.Option.HALFSAMPLERATE) {
+     this.pcm.samplerate /= 2;
+     this.pcm.length     /= 2;
+
+     throw new Error("HALFSAMPLERATE is not supported. What do you think? As if I have the time for this");
+     }
+     */
+
+    this.full(frame, nch, ns);
+    this.phase = (this.phase + ns) % 16;
+};
+
+module.exports = MP3Synth;
+
+},{"./utils":15}],14:[function(require,module,exports){
+/*
+ * These are the scalefactor values for Layer I and Layer II.
+ * The values are from Table B.1 of ISO/IEC 11172-3.
+ *
+ * Strictly speaking, Table B.1 has only 63 entries (0-62), thus a strict
+ * interpretation of ISO/IEC 11172-3 would suggest that a scalefactor index of
+ * 63 is invalid. However, for better compatibility with current practices, we
+ * add a 64th entry.
+ */
+exports.SF_TABLE = new Float32Array([
+    2.000000000000, 1.587401051968, 1.259921049895, 1.000000000000, 
+    0.793700525984, 0.629960524947, 0.500000000000, 0.396850262992,
+    0.314980262474, 0.250000000000, 0.198425131496, 0.157490131237,
+    0.125000000000, 0.099212565748, 0.078745065618, 0.062500000000,
+    0.049606282874, 0.039372532809, 0.031250000000, 0.024803141437,
+    0.019686266405, 0.015625000000, 0.012401570719, 0.009843133202,
+    0.007812500000, 0.006200785359, 0.004921566601, 0.003906250000,
+    0.003100392680, 0.002460783301, 0.001953125000, 0.001550196340,
+    0.001230391650, 0.000976562500, 0.000775098170, 0.000615195825,
+    0.000488281250, 0.000387549085, 0.000307597913, 0.000244140625,
+    0.000193774542, 0.000153798956, 0.000122070313, 0.000096887271,
+    0.000076899478, 0.000061035156, 0.000048443636, 0.000038449739,
+    0.000030517578, 0.000024221818, 0.000019224870, 0.000015258789,
+    0.000012110909, 0.000009612435, 0.000007629395, 0.000006055454,
+    0.000004806217, 0.000003814697, 0.000003027727, 0.000002403109,
+    0.000001907349, 0.000001513864, 0.000001201554, 0.000000000000
+]);
+
+/*
+ * MPEG-1 scalefactor band widths
+ * derived from Table B.8 of ISO/IEC 11172-3
+ */
+const SFB_48000_LONG = new Uint8Array([
+    4,  4,  4,  4,  4,  4,  6,  6,  6,   8,  10,
+    12, 16, 18, 22, 28, 34, 40, 46, 54,  54, 192
+]);
+
+const SFB_44100_LONG = new Uint8Array([
+    4,  4,  4,  4,  4,  4,  6,  6,  8,   8,  10,
+    12, 16, 20, 24, 28, 34, 42, 50, 54,  76, 158
+]);
+
+const SFB_32000_LONG = new Uint8Array([
+    4,  4,  4,  4,  4,  4,  6,  6,  8,  10,  12,
+    16, 20, 24, 30, 38, 46, 56, 68, 84, 102,  26
+]);
+
+const SFB_48000_SHORT = new Uint8Array([
+    4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  6,
+    6,  6,  6,  6,  6, 10, 10, 10, 12, 12, 12, 14, 14,
+    14, 16, 16, 16, 20, 20, 20, 26, 26, 26, 66, 66, 66
+]);
+
+const SFB_44100_SHORT = new Uint8Array([
+    4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  6,
+    6,  6,  8,  8,  8, 10, 10, 10, 12, 12, 12, 14, 14,
+    14, 18, 18, 18, 22, 22, 22, 30, 30, 30, 56, 56, 56
+]);
+
+const SFB_32000_SHORT = new Uint8Array([
+    4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  6,
+    6,  6,  8,  8,  8, 12, 12, 12, 16, 16, 16, 20, 20,
+    20, 26, 26, 26, 34, 34, 34, 42, 42, 42, 12, 12, 12
+]);
+
+const SFB_48000_MIXED = new Uint8Array([
+    /* long */   4,  4,  4,  4,  4,  4,  6,  6,
+    /* short */  4,  4,  4,  6,  6,  6,  6,  6,  6, 10,
+    10, 10, 12, 12, 12, 14, 14, 14, 16, 16,
+    16, 20, 20, 20, 26, 26, 26, 66, 66, 66
+]);
+
+const SFB_44100_MIXED = new Uint8Array([
+    /* long */   4,  4,  4,  4,  4,  4,  6,  6,
+    /* short */  4,  4,  4,  6,  6,  6,  8,  8,  8, 10,
+    10, 10, 12, 12, 12, 14, 14, 14, 18, 18,
+    18, 22, 22, 22, 30, 30, 30, 56, 56, 56
+]);
+
+const SFB_32000_MIXED = new Uint8Array([
+    /* long */   4,  4,  4,  4,  4,  4,  6,  6,
+    /* short */  4,  4,  4,  6,  6,  6,  8,  8,  8, 12,
+    12, 12, 16, 16, 16, 20, 20, 20, 26, 26,
+    26, 34, 34, 34, 42, 42, 42, 12, 12, 12
+]);
+
+/*
+ * MPEG-2 scalefactor band widths
+ * derived from Table B.2 of ISO/IEC 13818-3
+ */
+const SFB_24000_LONG = new Uint8Array([
+    6,  6,  6,  6,  6,  6,  8, 10, 12,  14,  16,
+   18, 22, 26, 32, 38, 46, 54, 62, 70,  76,  36
+]);
+
+const SFB_22050_LONG = new Uint8Array([
+    6,  6,  6,  6,  6,  6,  8, 10, 12,  14,  16,
+   20, 24, 28, 32, 38, 46, 52, 60, 68,  58,  54
+]);
+
+const SFB_16000_LONG = SFB_22050_LONG;
+
+const SFB_24000_SHORT = new Uint8Array([
+   4,  4,  4,  4,  4,  4,  4,  4,  4,  6,  6,  6,  8,
+   8,  8, 10, 10, 10, 12, 12, 12, 14, 14, 14, 18, 18,
+  18, 24, 24, 24, 32, 32, 32, 44, 44, 44, 12, 12, 12
+]);
+
+const SFB_22050_SHORT = new Uint8Array([
+   4,  4,  4,  4,  4,  4,  4,  4,  4,  6,  6,  6,  6,
+   6,  6,  8,  8,  8, 10, 10, 10, 14, 14, 14, 18, 18,
+  18, 26, 26, 26, 32, 32, 32, 42, 42, 42, 18, 18, 18
+]);
+
+const SFB_16000_SHORT = new Uint8Array([
+   4,  4,  4,  4,  4,  4,  4,  4,  4,  6,  6,  6,  8,
+   8,  8, 10, 10, 10, 12, 12, 12, 14, 14, 14, 18, 18,
+  18, 24, 24, 24, 30, 30, 30, 40, 40, 40, 18, 18, 18
+]);
+
+const SFB_24000_MIXED = new Uint8Array([
+  /* long */   6,  6,  6,  6,  6,  6,
+  /* short */  6,  6,  6,  8,  8,  8, 10, 10, 10, 12,
+              12, 12, 14, 14, 14, 18, 18, 18, 24, 24,
+              24, 32, 32, 32, 44, 44, 44, 12, 12, 12
+]);
+
+const SFB_22050_MIXED = new Uint8Array([
+  /* long */   6,  6,  6,  6,  6,  6,
+  /* short */  6,  6,  6,  6,  6,  6,  8,  8,  8, 10,
+              10, 10, 14, 14, 14, 18, 18, 18, 26, 26,
+              26, 32, 32, 32, 42, 42, 42, 18, 18, 18
+]);
+
+const SFB_16000_MIXED = new Uint8Array([
+  /* long */   6,  6,  6,  6,  6,  6,
+  /* short */  6,  6,  6,  8,  8,  8, 10, 10, 10, 12,
+              12, 12, 14, 14, 14, 18, 18, 18, 24, 24,
+              24, 30, 30, 30, 40, 40, 40, 18, 18, 18
+]);
+
+/*
+ * MPEG 2.5 scalefactor band widths
+ * derived from public sources
+ */
+const SFB_12000_LONG = SFB_16000_LONG;
+const SFB_11025_LONG = SFB_12000_LONG;
+
+const SFB_8000_LONG = new Uint8Array([
+  12, 12, 12, 12, 12, 12, 16, 20, 24,  28,  32,
+  40, 48, 56, 64, 76, 90,  2,  2,  2,   2,   2
+]);
+
+const SFB_12000_SHORT = SFB_16000_SHORT;
+const SFB_11025_SHORT = SFB_12000_SHORT;
+
+const SFB_8000_SHORT = new Uint8Array([
+   8,  8,  8,  8,  8,  8,  8,  8,  8, 12, 12, 12, 16,
+  16, 16, 20, 20, 20, 24, 24, 24, 28, 28, 28, 36, 36,
+  36,  2,  2,  2,  2,  2,  2,  2,  2,  2, 26, 26, 26
+]);
+
+const SFB_12000_MIXED = SFB_16000_MIXED;
+const SFB_11025_MIXED = SFB_12000_MIXED;
+
+/* the 8000 Hz short block scalefactor bands do not break after
+   the first 36 frequency lines, so this is probably wrong */
+const SFB_8000_MIXED = new Uint8Array([
+  /* long */  12, 12, 12,
+  /* short */  4,  4,  4,  8,  8,  8, 12, 12, 12, 16, 16, 16,
+              20, 20, 20, 24, 24, 24, 28, 28, 28, 36, 36, 36,
+               2,  2,  2,  2,  2,  2,  2,  2,  2, 26, 26, 26
+]);
+
+exports.SFBWIDTH_TABLE = [
+    { l: SFB_48000_LONG, s: SFB_48000_SHORT, m: SFB_48000_MIXED },
+    { l: SFB_44100_LONG, s: SFB_44100_SHORT, m: SFB_44100_MIXED },
+    { l: SFB_32000_LONG, s: SFB_32000_SHORT, m: SFB_32000_MIXED },
+    { l: SFB_24000_LONG, s: SFB_24000_SHORT, m: SFB_24000_MIXED },
+    { l: SFB_22050_LONG, s: SFB_22050_SHORT, m: SFB_22050_MIXED },
+    { l: SFB_16000_LONG, s: SFB_16000_SHORT, m: SFB_16000_MIXED },
+    { l: SFB_12000_LONG, s: SFB_12000_SHORT, m: SFB_12000_MIXED },
+    { l: SFB_11025_LONG, s: SFB_11025_SHORT, m: SFB_11025_MIXED },
+    { l:  SFB_8000_LONG, s:  SFB_8000_SHORT, m:  SFB_8000_MIXED }
+];
+
+exports.PRETAB = new Uint8Array([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 3, 2, 0
+]);
+
+/*
+ * fractional powers of two
+ * used for requantization and joint stereo decoding
+ *
+ * ROOT_TABLE[3 + x] = 2^(x/4)
+ */
+exports.ROOT_TABLE = new Float32Array([
+    /* 2^(-3/4) */ 0.59460355750136,
+    /* 2^(-2/4) */ 0.70710678118655,
+    /* 2^(-1/4) */ 0.84089641525371,
+    /* 2^( 0/4) */ 1.00000000000000,
+    /* 2^(+1/4) */ 1.18920711500272,
+    /* 2^(+2/4) */ 1.41421356237310,
+    /* 2^(+3/4) */ 1.68179283050743
+]);
+
+exports.CS = new Float32Array([
+    +0.857492926 , +0.881741997,
+    +0.949628649 , +0.983314592,
+    +0.995517816 , +0.999160558,
+    +0.999899195 , +0.999993155
+]);
+
+exports.CA = new Float32Array([
+    -0.514495755, -0.471731969,
+    -0.313377454, -0.181913200,
+    -0.094574193, -0.040965583,
+    -0.014198569, -0.003699975
+]);
+
+exports.COUNT1TABLE_SELECT = 0x01;
+exports.SCALEFAC_SCALE     = 0x02;
+exports.PREFLAG            = 0x04;
+exports.MIXED_BLOCK_FLAG   = 0x08;
+
+exports.I_STEREO  = 0x1;
+exports.MS_STEREO = 0x2;
+
+/*
+ * windowing coefficients for long blocks
+ * derived from section 2.4.3.4.10.3 of ISO/IEC 11172-3
+ *
+ * WINDOW_L[i] = sin((PI / 36) * (i + 1/2))
+ */
+exports.WINDOW_L = new Float32Array([
+    0.043619387, 0.130526192,
+    0.216439614, 0.300705800,
+    0.382683432, 0.461748613,
+    0.537299608, 0.608761429,
+    0.675590208, 0.737277337,
+    0.793353340, 0.843391446,
+
+    0.887010833, 0.923879533,
+    0.953716951, 0.976296007,
+    0.991444861, 0.999048222,
+    0.999048222, 0.991444861,
+    0.976296007, 0.953716951,
+    0.923879533, 0.887010833,
+
+    0.843391446, 0.793353340,
+    0.737277337, 0.675590208,
+    0.608761429, 0.537299608,
+    0.461748613, 0.382683432,
+    0.300705800, 0.216439614,
+    0.130526192, 0.043619387
+]);
+
+/*
+ * windowing coefficients for short blocks
+ * derived from section 2.4.3.4.10.3 of ISO/IEC 11172-3
+ *
+ * WINDOW_S[i] = sin((PI / 12) * (i + 1/2))
+ */
+exports.WINDOW_S = new Float32Array([
+    0.130526192, 0.382683432,
+    0.608761429, 0.793353340,
+    0.923879533, 0.991444861,
+    0.991444861, 0.923879533,
+    0.793353340, 0.608761429,
+    0.382683432, 0.130526192
+]);
+
+/*
+ * coefficients for intensity stereo processing
+ * derived from section 2.4.3.4.9.3 of ISO/IEC 11172-3
+ *
+ * is_ratio[i] = tan(i * (PI / 12))
+ * IS_TABLE[i] = is_ratio[i] / (1 + is_ratio[i])
+ */
+exports.IS_TABLE = new Float32Array([
+    0.000000000,
+    0.211324865,
+    0.366025404,
+    0.500000000,
+    0.633974596,
+    0.788675135,
+    1.000000000
+]);
+
+/*
+ * coefficients for LSF intensity stereo processing
+ * derived from section 2.4.3.2 of ISO/IEC 13818-3
+ *
+ * IS_LSF_TABLE[0][i] = (1 / sqrt(sqrt(2)))^(i + 1)
+ * IS_LSF_TABLE[1][i] = (1 /      sqrt(2)) ^(i + 1)
+ */
+exports.IS_LSF_TABLE = [
+    new Float32Array([
+        0.840896415,
+        0.707106781,
+        0.594603558,
+        0.500000000,
+        0.420448208,
+        0.353553391,
+        0.297301779,
+        0.250000000,
+        0.210224104,
+        0.176776695,
+        0.148650889,
+        0.125000000,
+        0.105112052,
+        0.088388348,
+        0.074325445
+    ]), 
+    new Float32Array([
+        0.707106781,
+        0.500000000,
+        0.353553391,
+        0.250000000,
+        0.176776695,
+        0.125000000,
+        0.088388348,
+        0.062500000,
+        0.044194174,
+        0.031250000,
+        0.022097087,
+        0.015625000,
+        0.011048543,
+        0.007812500,
+        0.005524272
+    ])
+];
+
+/*
+ * scalefactor bit lengths
+ * derived from section 2.4.2.7 of ISO/IEC 11172-3
+ */
+exports.SFLEN_TABLE = [
+    { slen1: 0, slen2: 0 }, { slen1: 0, slen2: 1 }, { slen1: 0, slen2: 2 }, { slen1: 0, slen2: 3 },
+    { slen1: 3, slen2: 0 }, { slen1: 1, slen2: 1 }, { slen1: 1, slen2: 2 }, { slen1: 1, slen2: 3 },
+    { slen1: 2, slen2: 1 }, { slen1: 2, slen2: 2 }, { slen1: 2, slen2: 3 }, { slen1: 3, slen2: 1 },
+    { slen1: 3, slen2: 2 }, { slen1: 3, slen2: 3 }, { slen1: 4, slen2: 2 }, { slen1: 4, slen2: 3 }    
+];
+
+/*
+ * number of LSF scalefactor band values
+ * derived from section 2.4.3.2 of ISO/IEC 13818-3
+ */
+exports.NSFB_TABLE = [
+    [ [  6,  5,  5, 5 ],
+      [  9,  9,  9, 9 ],
+      [  6,  9,  9, 9 ] ],
+
+    [ [  6,  5,  7, 3 ],
+      [  9,  9, 12, 6 ],
+      [  6,  9, 12, 6 ] ],
+
+    [ [ 11, 10,  0, 0 ],
+      [ 18, 18,  0, 0 ],
+      [ 15, 18,  0, 0 ] ],
+
+    [ [  7,  7,  7, 0 ],
+      [ 12, 12, 12, 0 ],
+      [  6, 15, 12, 0 ] ],
+
+    [ [  6,  6,  6, 3 ],
+      [ 12,  9,  9, 6 ],
+      [  6, 12,  9, 6 ] ],
+
+    [ [  8,  8,  5, 0 ],
+      [ 15, 12,  9, 0 ],
+      [  6, 18,  9, 0 ] ]
+];
+ 
+},{}],15:[function(require,module,exports){
+/**
+ * Makes a multidimensional array
+ */
+exports.makeArray = function(lengths, Type) {
+    if (!Type) Type = Float64Array;
+    
+    if (lengths.length === 1) {
+        return new Type(lengths[0]);
+    }
+    
+    var ret = [],
+        len = lengths[0];
+        
+    for (var j = 0; j < len; j++) {
+        ret[j] = exports.makeArray(lengths.slice(1), Type);
+    }
+    
+    return ret;
+};
+
+},{}]},{},[1])
+
+
+//# sourceMappingURL=mp3.js.map

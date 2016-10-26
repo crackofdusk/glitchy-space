@@ -1,5 +1,5 @@
-(function() {
-    var Aglib;
+(function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);throw new Error("Cannot find module '"+o+"'")}var f=n[o]={exports:{}};t[o][0].call(f.exports,function(e){var n=t[o][1][e];return s(n?n:e)},f,f.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
+var Aglib;
 
 Aglib = (function() {
   var BITOFF, KB0, MAX_DATATYPE_BITS_16, MAX_PREFIX_16, MAX_PREFIX_32, MAX_RUN_DEFAULT, MB0, MDENSHIFT, MMULSHIFT, MOFF, N_MAX_MEAN_CLAMP, N_MEAN_CLAMP_VAL, PB0, QB, QBSHIFT, dyn_get_16, dyn_get_32, lead;
@@ -40,7 +40,6 @@ Aglib = (function() {
 
   lead = function(input) {
     var curbyte, output;
-
     output = 0;
     curbyte = 0;
     while (true) {
@@ -88,7 +87,6 @@ Aglib = (function() {
 
   dyn_get_16 = function(data, m, k) {
     var bitsInPrefix, offs, result, stream, v;
-
     offs = data.bitPosition;
     stream = data.peek(32 - offs) << offs;
     bitsInPrefix = lead(~stream);
@@ -112,7 +110,6 @@ Aglib = (function() {
 
   dyn_get_32 = function(data, m, k, maxbits) {
     var offs, result, stream, v;
-
     offs = data.bitPosition;
     stream = data.peek(32 - offs) << offs;
     result = lead(~stream);
@@ -151,7 +148,6 @@ Aglib = (function() {
 
   Aglib.dyn_decomp = function(params, data, pc, samples, maxSize) {
     var c, j, k, kb, m, mb, multiplier, mz, n, ndecode, pb, wb, zmode, _i;
-
     pb = params.pb, kb = params.kb, wb = params.wb, mb = params.mb0;
     zmode = 0;
     c = 0;
@@ -191,7 +187,243 @@ Aglib = (function() {
   return Aglib;
 
 })();
-    var Dplib;
+
+module.exports = Aglib;
+
+
+},{}],2:[function(require,module,exports){
+(function (global){
+var ALACDecoder, AV, Aglib, Dplib, Matrixlib,
+  __hasProp = {}.hasOwnProperty,
+  __extends = function(child, parent) { for (var key in parent) { if (__hasProp.call(parent, key)) child[key] = parent[key]; } function ctor() { this.constructor = child; } ctor.prototype = parent.prototype; child.prototype = new ctor(); child.__super__ = parent.prototype; return child; };
+
+AV = (typeof window !== "undefined" ? window['AV'] : typeof global !== "undefined" ? global['AV'] : null);
+
+Aglib = require('./ag_dec');
+
+Dplib = require('./dp_dec');
+
+Matrixlib = require('./matrix_dec');
+
+ALACDecoder = (function(_super) {
+  var ID_CCE, ID_CPE, ID_DSE, ID_END, ID_FIL, ID_LFE, ID_PCE, ID_SCE;
+
+  __extends(ALACDecoder, _super);
+
+  function ALACDecoder() {
+    return ALACDecoder.__super__.constructor.apply(this, arguments);
+  }
+
+  AV.Decoder.register('alac', ALACDecoder);
+
+  ID_SCE = 0;
+
+  ID_CPE = 1;
+
+  ID_CCE = 2;
+
+  ID_LFE = 3;
+
+  ID_DSE = 4;
+
+  ID_PCE = 5;
+
+  ID_FIL = 6;
+
+  ID_END = 7;
+
+  ALACDecoder.prototype.setCookie = function(cookie) {
+    var data, predictorBuffer, _base;
+    data = AV.Stream.fromBuffer(cookie);
+    if (data.peekString(4, 4) === 'frma') {
+      data.advance(12);
+    }
+    if (data.peekString(4, 4) === 'alac') {
+      data.advance(12);
+    }
+    this.config = {
+      frameLength: data.readUInt32(),
+      compatibleVersion: data.readUInt8(),
+      bitDepth: data.readUInt8(),
+      pb: data.readUInt8(),
+      mb: data.readUInt8(),
+      kb: data.readUInt8(),
+      numChannels: data.readUInt8(),
+      maxRun: data.readUInt16(),
+      maxFrameBytes: data.readUInt32(),
+      avgBitRate: data.readUInt32(),
+      sampleRate: data.readUInt32()
+    };
+    (_base = this.format).bitsPerChannel || (_base.bitsPerChannel = this.config.bitDepth);
+    this.mixBuffers = [new Int32Array(this.config.frameLength), new Int32Array(this.config.frameLength)];
+    predictorBuffer = new ArrayBuffer(this.config.frameLength * 4);
+    this.predictor = new Int32Array(predictorBuffer);
+    return this.shiftBuffer = new Int16Array(predictorBuffer);
+  };
+
+  ALACDecoder.prototype.readChunk = function(data) {
+    var buf, bytesShifted, ch, chanBits, channelIndex, channels, coefs, count, dataByteAlignFlag, denShift, elementInstanceTag, end, escapeFlag, i, j, kb, maxRun, mb, mixBits, mixRes, mode, num, numChannels, out16, output, params, partialFrame, pb, pbFactor, samples, shift, shiftbits, status, table, tag, unused, val, _i, _j, _k, _l, _m, _n, _o, _ref, _ref1, _ref2;
+    if (!this.stream.available(4)) {
+      return;
+    }
+    data = this.bitstream;
+    samples = this.config.frameLength;
+    numChannels = this.config.numChannels;
+    channelIndex = 0;
+    output = new ArrayBuffer(samples * numChannels * this.config.bitDepth / 8);
+    end = false;
+    while (!end) {
+      tag = data.read(3);
+      switch (tag) {
+        case ID_SCE:
+        case ID_LFE:
+        case ID_CPE:
+          channels = tag === ID_CPE ? 2 : 1;
+          if (channelIndex + channels > numChannels) {
+            throw new Error('Too many channels!');
+          }
+          elementInstanceTag = data.read(4);
+          unused = data.read(12);
+          if (unused !== 0) {
+            throw new Error('Unused part of header does not contain 0, it should');
+          }
+          partialFrame = data.read(1);
+          bytesShifted = data.read(2);
+          escapeFlag = data.read(1);
+          if (bytesShifted === 3) {
+            throw new Error("Bytes are shifted by 3, they shouldn't be");
+          }
+          if (partialFrame) {
+            samples = data.read(32);
+          }
+          if (escapeFlag === 0) {
+            shift = bytesShifted * 8;
+            chanBits = this.config.bitDepth - shift + channels - 1;
+            mixBits = data.read(8);
+            mixRes = data.read(8);
+            mode = [];
+            denShift = [];
+            pbFactor = [];
+            num = [];
+            coefs = [];
+            for (ch = _i = 0; _i < channels; ch = _i += 1) {
+              mode[ch] = data.read(4);
+              denShift[ch] = data.read(4);
+              pbFactor[ch] = data.read(3);
+              num[ch] = data.read(5);
+              table = coefs[ch] = new Int16Array(32);
+              for (i = _j = 0, _ref = num[ch]; _j < _ref; i = _j += 1) {
+                table[i] = data.read(16);
+              }
+            }
+            if (bytesShifted) {
+              shiftbits = data.copy();
+              data.advance(shift * channels * samples);
+            }
+            _ref1 = this.config, mb = _ref1.mb, pb = _ref1.pb, kb = _ref1.kb, maxRun = _ref1.maxRun;
+            for (ch = _k = 0; _k < channels; ch = _k += 1) {
+              params = Aglib.ag_params(mb, (pb * pbFactor[ch]) / 4, kb, samples, samples, maxRun);
+              status = Aglib.dyn_decomp(params, data, this.predictor, samples, chanBits);
+              if (!status) {
+                throw new Error('Error in Aglib.dyn_decomp');
+              }
+              if (mode[ch] === 0) {
+                Dplib.unpc_block(this.predictor, this.mixBuffers[ch], samples, coefs[ch], num[ch], chanBits, denShift[ch]);
+              } else {
+                Dplib.unpc_block(this.predictor, this.predictor, samples, null, 31, chanBits, 0);
+                Dplib.unpc_block(this.predictor, this.mixBuffers[ch], samples, coefs[ch], num[ch], chanBits, denShift[ch]);
+              }
+            }
+          } else {
+            chanBits = this.config.bitDepth;
+            shift = 32 - chanBits;
+            for (i = _l = 0; _l < samples; i = _l += 1) {
+              for (ch = _m = 0; _m < channels; ch = _m += 1) {
+                val = (data.read(chanBits) << shift) >> shift;
+                this.mixBuffers[ch][i] = val;
+              }
+            }
+            mixBits = mixRes = 0;
+            bytesShifted = 0;
+          }
+          if (bytesShifted) {
+            shift = bytesShifted * 8;
+            for (i = _n = 0, _ref2 = samples * channels; _n < _ref2; i = _n += 1) {
+              this.shiftBuffer[i] = shiftbits.read(shift);
+            }
+          }
+          switch (this.config.bitDepth) {
+            case 16:
+              out16 = new Int16Array(output, channelIndex);
+              if (channels === 2) {
+                Matrixlib.unmix16(this.mixBuffers[0], this.mixBuffers[1], out16, numChannels, samples, mixBits, mixRes);
+              } else {
+                j = 0;
+                buf = this.mixBuffers[0];
+                for (i = _o = 0; _o < samples; i = _o += 1) {
+                  out16[j] = buf[i];
+                  j += numChannels;
+                }
+              }
+              break;
+            default:
+              throw new Error('Only supports 16-bit samples right now');
+          }
+          channelIndex += channels;
+          break;
+        case ID_CCE:
+        case ID_PCE:
+          throw new Error("Unsupported element: " + tag);
+          break;
+        case ID_DSE:
+          elementInstanceTag = data.read(4);
+          dataByteAlignFlag = data.read(1);
+          count = data.read(8);
+          if (count === 255) {
+            count += data.read(8);
+          }
+          if (dataByteAlignFlag) {
+            data.align();
+          }
+          data.advance(count * 8);
+          if (!(data.pos < data.length)) {
+            throw new Error('buffer overrun');
+          }
+          break;
+        case ID_FIL:
+          count = data.read(4);
+          if (count === 15) {
+            count += data.read(8) - 1;
+          }
+          data.advance(count * 8);
+          if (!(data.pos < data.length)) {
+            throw new Error('buffer overrun');
+          }
+          break;
+        case ID_END:
+          data.align();
+          end = true;
+          break;
+        default:
+          throw new Error("Unknown element: " + tag);
+      }
+      if (channelIndex > numChannels) {
+        throw new Error('Channel index too large.');
+      }
+    }
+    return new Int16Array(output);
+  };
+
+  return ALACDecoder;
+
+})(AV.Decoder);
+
+module.exports = ALACDecoder;
+
+
+}).call(this,typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{"./ag_dec":1,"./dp_dec":3,"./matrix_dec":4}],3:[function(require,module,exports){
+var Dplib;
 
 Dplib = (function() {
   var copy;
@@ -200,7 +432,6 @@ Dplib = (function() {
 
   copy = function(dst, dstOffset, src, srcOffset, n) {
     var destination, source;
-
     destination = new Uint8Array(dst, dstOffset, n);
     source = new Uint8Array(src, srcOffset, n);
     destination.set(source);
@@ -209,7 +440,6 @@ Dplib = (function() {
 
   Dplib.unpc_block = function(pc1, out, num, coefs, active, chanbits, denshift) {
     var a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7, chanshift, dd, del, del0, denhalf, i, j, lim, offset, prev, sg, sgn, sum1, top, _i, _j, _k, _l, _m, _n, _o, _p, _ref, _ref1;
-
     chanshift = 32 - chanbits;
     denhalf = 1 << (denshift - 1);
     out[0] = pc1[0];
@@ -446,14 +676,18 @@ Dplib = (function() {
   return Dplib;
 
 })();
-    var Matrixlib;
+
+module.exports = Dplib;
+
+
+},{}],4:[function(require,module,exports){
+var Matrixlib;
 
 Matrixlib = (function() {
   function Matrixlib() {}
 
   Matrixlib.unmix16 = function(u, v, out, stride, samples, mixbits, mixres) {
     var i, l, _i, _j;
-
     if (mixres === 0) {
       for (i = _i = 0; _i < samples; i = _i += 1) {
         out[i * stride + 0] = u[i];
@@ -471,223 +705,11 @@ Matrixlib = (function() {
   return Matrixlib;
 
 })();
-    var ALACDecoder, _ref,
-  __hasProp = {}.hasOwnProperty,
-  __extends = function(child, parent) { for (var key in parent) { if (__hasProp.call(parent, key)) child[key] = parent[key]; } function ctor() { this.constructor = child; } ctor.prototype = parent.prototype; child.prototype = new ctor(); child.__super__ = parent.prototype; return child; };
 
-ALACDecoder = (function(_super) {
-  var ID_CCE, ID_CPE, ID_DSE, ID_END, ID_FIL, ID_LFE, ID_PCE, ID_SCE;
+module.exports = Matrixlib;
 
-  __extends(ALACDecoder, _super);
 
-  function ALACDecoder() {
-    _ref = ALACDecoder.__super__.constructor.apply(this, arguments);
-    return _ref;
-  }
+},{}]},{},[2])
 
-  AV.Decoder.register('alac', ALACDecoder);
 
-  ID_SCE = 0;
-
-  ID_CPE = 1;
-
-  ID_CCE = 2;
-
-  ID_LFE = 3;
-
-  ID_DSE = 4;
-
-  ID_PCE = 5;
-
-  ID_FIL = 6;
-
-  ID_END = 7;
-
-  ALACDecoder.prototype.setCookie = function(cookie) {
-    var data, predictorBuffer, _base;
-
-    data = AV.Stream.fromBuffer(cookie);
-    if (data.peekString(4, 4) === 'frma') {
-      data.advance(12);
-    }
-    if (data.peekString(4, 4) === 'alac') {
-      data.advance(12);
-    }
-    this.config = {
-      frameLength: data.readUInt32(),
-      compatibleVersion: data.readUInt8(),
-      bitDepth: data.readUInt8(),
-      pb: data.readUInt8(),
-      mb: data.readUInt8(),
-      kb: data.readUInt8(),
-      numChannels: data.readUInt8(),
-      maxRun: data.readUInt16(),
-      maxFrameBytes: data.readUInt32(),
-      avgBitRate: data.readUInt32(),
-      sampleRate: data.readUInt32()
-    };
-    (_base = this.format).bitsPerChannel || (_base.bitsPerChannel = this.config.bitDepth);
-    this.mixBuffers = [new Int32Array(this.config.frameLength), new Int32Array(this.config.frameLength)];
-    predictorBuffer = new ArrayBuffer(this.config.frameLength * 4);
-    this.predictor = new Int32Array(predictorBuffer);
-    return this.shiftBuffer = new Int16Array(predictorBuffer);
-  };
-
-  ALACDecoder.prototype.readChunk = function(data) {
-    var buf, bytesShifted, ch, chanBits, channelIndex, channels, coefs, count, dataByteAlignFlag, denShift, elementInstanceTag, end, escapeFlag, i, j, kb, maxRun, mb, mixBits, mixRes, mode, num, numChannels, out16, output, params, partialFrame, pb, pbFactor, samples, shift, shiftbits, status, table, tag, unused, val, _i, _j, _k, _l, _m, _n, _o, _ref1, _ref2, _ref3;
-
-    if (!this.stream.available(4)) {
-      return;
-    }
-    data = this.bitstream;
-    samples = this.config.frameLength;
-    numChannels = this.config.numChannels;
-    channelIndex = 0;
-    output = new ArrayBuffer(samples * numChannels * this.config.bitDepth / 8);
-    end = false;
-    while (!end) {
-      tag = data.read(3);
-      switch (tag) {
-        case ID_SCE:
-        case ID_LFE:
-        case ID_CPE:
-          channels = tag === ID_CPE ? 2 : 1;
-          if (channelIndex + channels > numChannels) {
-            throw new Error('Too many channels!');
-          }
-          elementInstanceTag = data.read(4);
-          unused = data.read(12);
-          if (unused !== 0) {
-            throw new Error('Unused part of header does not contain 0, it should');
-          }
-          partialFrame = data.read(1);
-          bytesShifted = data.read(2);
-          escapeFlag = data.read(1);
-          if (bytesShifted === 3) {
-            throw new Error("Bytes are shifted by 3, they shouldn't be");
-          }
-          if (partialFrame) {
-            samples = data.read(32);
-          }
-          if (escapeFlag === 0) {
-            shift = bytesShifted * 8;
-            chanBits = this.config.bitDepth - shift + channels - 1;
-            mixBits = data.read(8);
-            mixRes = data.read(8);
-            mode = [];
-            denShift = [];
-            pbFactor = [];
-            num = [];
-            coefs = [];
-            for (ch = _i = 0; _i < channels; ch = _i += 1) {
-              mode[ch] = data.read(4);
-              denShift[ch] = data.read(4);
-              pbFactor[ch] = data.read(3);
-              num[ch] = data.read(5);
-              table = coefs[ch] = new Int16Array(32);
-              for (i = _j = 0, _ref1 = num[ch]; _j < _ref1; i = _j += 1) {
-                table[i] = data.read(16);
-              }
-            }
-            if (bytesShifted) {
-              shiftbits = data.copy();
-              data.advance(shift * channels * samples);
-            }
-            _ref2 = this.config, mb = _ref2.mb, pb = _ref2.pb, kb = _ref2.kb, maxRun = _ref2.maxRun;
-            for (ch = _k = 0; _k < channels; ch = _k += 1) {
-              params = Aglib.ag_params(mb, (pb * pbFactor[ch]) / 4, kb, samples, samples, maxRun);
-              status = Aglib.dyn_decomp(params, data, this.predictor, samples, chanBits);
-              if (!status) {
-                throw new Error('Error in Aglib.dyn_decomp');
-              }
-              if (mode[ch] === 0) {
-                Dplib.unpc_block(this.predictor, this.mixBuffers[ch], samples, coefs[ch], num[ch], chanBits, denShift[ch]);
-              } else {
-                Dplib.unpc_block(this.predictor, this.predictor, samples, null, 31, chanBits, 0);
-                Dplib.unpc_block(this.predictor, this.mixBuffers[ch], samples, coefs[ch], num[ch], chanBits, denShift[ch]);
-              }
-            }
-          } else {
-            chanBits = this.config.bitDepth;
-            shift = 32 - chanBits;
-            for (i = _l = 0; _l < samples; i = _l += 1) {
-              for (ch = _m = 0; _m < channels; ch = _m += 1) {
-                val = (data.read(chanBits) << shift) >> shift;
-                this.mixBuffers[ch][i] = val;
-              }
-            }
-            mixBits = mixRes = 0;
-            bytesShifted = 0;
-          }
-          if (bytesShifted) {
-            shift = bytesShifted * 8;
-            for (i = _n = 0, _ref3 = samples * channels; _n < _ref3; i = _n += 1) {
-              this.shiftBuffer[i] = shiftbits.read(shift);
-            }
-          }
-          switch (this.config.bitDepth) {
-            case 16:
-              out16 = new Int16Array(output, channelIndex);
-              if (channels === 2) {
-                Matrixlib.unmix16(this.mixBuffers[0], this.mixBuffers[1], out16, numChannels, samples, mixBits, mixRes);
-              } else {
-                j = 0;
-                buf = this.mixBuffers[0];
-                for (i = _o = 0; _o < samples; i = _o += 1) {
-                  out16[j] = buf[i];
-                  j += numChannels;
-                }
-              }
-              break;
-            default:
-              throw new Error('Only supports 16-bit samples right now');
-          }
-          channelIndex += channels;
-          break;
-        case ID_CCE:
-        case ID_PCE:
-          throw new Error("Unsupported element: " + tag);
-          break;
-        case ID_DSE:
-          elementInstanceTag = data.read(4);
-          dataByteAlignFlag = data.read(1);
-          count = data.read(8);
-          if (count === 255) {
-            count += data.read(8);
-          }
-          if (dataByteAlignFlag) {
-            data.align();
-          }
-          data.advance(count * 8);
-          if (!(data.pos < data.length)) {
-            throw new Error('buffer overrun');
-          }
-          break;
-        case ID_FIL:
-          count = data.read(4);
-          if (count === 15) {
-            count += data.read(8) - 1;
-          }
-          data.advance(count * 8);
-          if (!(data.pos < data.length)) {
-            throw new Error('buffer overrun');
-          }
-          break;
-        case ID_END:
-          data.align();
-          end = true;
-          break;
-        default:
-          throw new Error("Unknown element: " + tag);
-      }
-      if (channelIndex > numChannels) {
-        throw new Error('Channel index too large.');
-      }
-    }
-    return new Int16Array(output);
-  };
-
-  return ALACDecoder;
-
-})(AV.Decoder);
-})();
+//# sourceMappingURL=alac.js.map
